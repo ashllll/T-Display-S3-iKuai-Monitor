@@ -26,8 +26,10 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(err);
 
+    // Keep the backlight off until LVGL has rendered and transferred its
+    // first complete frame.  Otherwise the panel can show undefined GRAM
+    // contents as a power-on garbage screen before the UI task starts.
     lcd_init();
-    lcd_set_backlight(APP_BL_PCT);
 
     widget_start();
 

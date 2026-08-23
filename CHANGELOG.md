@@ -1,5 +1,27 @@
 # Changelog / 变更日志
 
+## 2026-08-23 — Rendering, trust state, and navigation hardening
+
+### 中文
+
+- 焦点吞吐主数字从 LVGL 默认 4bpp Montserrat 48 改为项目原生 2bpp 清晰数字字体，避免低像素密度屏上的灰边。
+- 首帧 flush 增加 1 秒超时；成功后才开背光，超时时保持黑屏并继续等待迟到的完成回调，避免花屏和 UI 任务永久等待。
+- 将 `WARMING/LIVE/STALE/TIMEOUT/OFFLINE/DEMO/NO DATA` 收敛为统一数据可信度模型；`STALE` 使用橙色提醒，不再冒充红色故障。
+- 吞吐单位增加 768/1152 回切迟滞，降低阈值附近 `KB/s` 与 `MB/s` 反复切换。
+- 将两个板载按键改为固定方向：BOOT/GPIO0 上一页、IO14/GPIO14 下一页；移除多击窗口与按压时长判断，30ms 消抖后立即响应，十页系统最多五步可达。
+
+### English
+
+- Replaced the focus throughput value's built-in 4bpp Montserrat 48 font with the project's native crisp 2bpp metric font.
+- Added a one-second first-flush timeout. The backlight turns on only after a completed transfer; timeouts stay dark while waiting for a late completion instead of blocking forever.
+- Centralized `WARMING/LIVE/STALE/TIMEOUT/OFFLINE/DEMO/NO DATA` as data-trust states; stale data now uses warning orange rather than fault red.
+- Added 768/1152 unit hysteresis to prevent repeated `KB/s` and `MB/s` switching near thresholds.
+- Assigned the two onboard buttons dedicated directions: BOOT/GPIO0 for previous and IO14/GPIO14 for next. Removing multi-click and hold timing makes navigation respond immediately after 30 ms debounce while keeping every page within five steps.
+
+### Validation boundary / 验证边界
+
+The live-data build enabled `APP_REQUIRE_LIVE_MODE`, which would fail compilation if `APP_DEMO_MODE` were enabled. PlatformIO completed at 67.3% RAM and 37.0% Flash. USB-JTAG verified the bootloader, partition table, and application independently, then runtime logs confirmed 8 MB PSRAM, `LCD ready`, the UI task on core 1, Wi-Fi/IP acquisition, an iKuai HTTP 200 response, and a healthy 30-second heap/curve report. No first-flush timeout, panic, assert, or reboot appeared. Cold-boot flower-screen removal, font sharpness, and both physical button directions still require direct physical-screen observation.
+
 ## 2026-08-21 — Data trust and recovery UX / 数据可信度与恢复体验
 
 ### 中文

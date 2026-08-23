@@ -29,7 +29,6 @@
 #include <time.h>
 
 LV_FONT_DECLARE(lv_font_montserrat_20);
-LV_FONT_DECLARE(lv_font_montserrat_48);
 LV_FONT_DECLARE(ui_font_crisp_12);
 LV_FONT_DECLARE(ui_font_crisp_36);
 
@@ -39,6 +38,9 @@ LV_FONT_DECLARE(ui_font_crisp_36);
 
 #ifndef APP_DEMO_MODE
 #define APP_DEMO_MODE 0
+#endif
+#if defined(APP_REQUIRE_LIVE_MODE) && APP_DEMO_MODE
+#error "APP_REQUIRE_LIVE_MODE requires APP_DEMO_MODE=0"
 #endif
 #ifndef APP_TZ
 #define APP_TZ "CST-8"
@@ -52,6 +54,16 @@ LV_FONT_DECLARE(ui_font_crisp_36);
 #define APP_BL_NIGHT_PCT 8
 #endif
 
+typedef enum {
+    DATA_TRUST_WARMING,
+    DATA_TRUST_LIVE,
+    DATA_TRUST_STALE,
+    DATA_TRUST_TIMEOUT,
+    DATA_TRUST_OFFLINE,
+    DATA_TRUST_DEMO,
+    DATA_TRUST_NO_DATA,
+} data_trust_t;
+
 static const char *TAG = "widget";
 
 #define BIT_IP (1 << 0)
@@ -62,6 +74,8 @@ static volatile uint8_t s_wifi_retry_count = 0;
 static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_night_dim = false;
 static lv_timer_t *s_roll_timer;
+static data_trust_t s_data_trust = APP_DEMO_MODE ? DATA_TRUST_DEMO : DATA_TRUST_WARMING;
+static void refresh_source_label(void);
 
 // ── 酷态科设计令牌：黑底 + 高饱和功能色，颜色只用于编码 ──
 #define CLR_BG       0x000000  // 纯黑底(OLED 省电)
@@ -359,18 +373,59 @@ static lv_obj_t *dot_status, *lbl_source;
 static lv_obj_t *lbl_main_curve_state, *lbl_curve_state;
 static lv_obj_t *lbl_curve_down, *lbl_curve_up, *lbl_curve_ping;
 
-static void fmt_rate(uint32_t bytes_per_sec, char *value, int value_cap, const char **unit) {
-    if (bytes_per_sec >= 1048576) {
-        float v = bytes_per_sec / 1048576.0f;
-        snprintf(value, value_cap, v >= 100 ? "%.0f" : "%.1f", v);
-        *unit = "MB/s";
-    } else if (bytes_per_sec >= 1024) {
-        float v = bytes_per_sec / 1024.0f;
-        snprintf(value, value_cap, v >= 100 ? "%.0f" : "%.1f", v);
-        *unit = "KB/s";
-    } else {
+typedef enum {
+    RATE_UNIT_B,
+    RATE_UNIT_KB,
+    RATE_UNIT_MB,
+    RATE_UNIT_GB,
+    RATE_UNIT_AUTO,
+} rate_unit_t;
+
+static rate_unit_t s_down_unit = RATE_UNIT_AUTO;
+static rate_unit_t s_up_unit = RATE_UNIT_AUTO;
+static rate_unit_t s_peak_unit = RATE_UNIT_AUTO;
+static rate_unit_t s_client_unit[3] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO, RATE_UNIT_AUTO };
+
+static rate_unit_t rate_unit_initial(uint32_t bytes_per_sec) {
+    if (bytes_per_sec >= 1024U * 1024U * 1024U) return RATE_UNIT_GB;
+    if (bytes_per_sec >= 1024U * 1024U) return RATE_UNIT_MB;
+    if (bytes_per_sec >= 1024U) return RATE_UNIT_KB;
+    return RATE_UNIT_B;
+}
+
+static void fmt_rate(uint32_t bytes_per_sec, rate_unit_t *state,
+                     char *value, int value_cap, const char **unit) {
+    static const uint32_t up_threshold[] = {
+        1280U,
+        1152U * 1024U,
+        1152U * 1024U * 1024U,
+    };
+    static const uint32_t down_threshold[] = {
+        0U,
+        768U,
+        768U * 1024U,
+        768U * 1024U * 1024U,
+    };
+
+    rate_unit_t selected = *state;
+    if (selected == RATE_UNIT_AUTO) selected = rate_unit_initial(bytes_per_sec);
+    while (selected < RATE_UNIT_GB && bytes_per_sec >= up_threshold[selected]) selected++;
+    while (selected > RATE_UNIT_B && bytes_per_sec < down_threshold[selected]) selected--;
+    *state = selected;
+
+    float divisor = 1.0f;
+    switch (selected) {
+        case RATE_UNIT_GB: divisor = 1024.0f * 1024.0f * 1024.0f; *unit = "GB/s"; break;
+        case RATE_UNIT_MB: divisor = 1024.0f * 1024.0f; *unit = "MB/s"; break;
+        case RATE_UNIT_KB: divisor = 1024.0f; *unit = "KB/s"; break;
+        default: *unit = "B/s"; break;
+    }
+
+    if (selected == RATE_UNIT_B) {
         snprintf(value, value_cap, "%u", (unsigned)bytes_per_sec);
-        *unit = "B/s";
+    } else {
+        float scaled = bytes_per_sec / divisor;
+        snprintf(value, value_cap, scaled >= 100.0f ? "%.0f" : "%.1f", scaled);
     }
 }
 
@@ -505,20 +560,28 @@ static void meteor_note_rate(uint32_t bps) {
 }
 
 
-// ═══════════════════ 十页系统(BOOT 单击翻页) ═══════════════════════
+// ═══════════════════ 十页系统(GPIO0 上一页 / GPIO14 下一页) ═══════════════════════
 // 0 总览 / 1 下行焦点 / 2 双通道 / 3 趋势 / 4 网络健康
 // 5 设备状态 / 6 路由健康 / 7 WAN / 8 客户端排行 / 9 无线 AC
 #define PAGE_COUNT 10
-#define PIN_BOOT 0   // BOOT 键,低电平有效
+#define PIN_BUTTON_PREV GPIO_NUM_0
+#define PIN_BUTTON_NEXT GPIO_NUM_14
+#define BUTTON_DEBOUNCE_MS 30
 
 static lv_obj_t *s_pg[PAGE_COUNT];
 static lv_obj_t *s_dots[PAGE_COUNT];
-static bool s_bl_off = false;
 static uint32_t s_last_key_ms = 0;
 static uint32_t s_dot_feedback_until_ms = 0;
 
-#define BUTTON_MULTI_CLICK_MS 260
-#define BUTTON_HOLD_MS 1200
+typedef struct {
+    gpio_num_t pin;
+    int stable;
+    int last_raw;
+    uint32_t changed_ms;
+} page_button_t;
+
+static page_button_t s_btn_prev = { .pin = PIN_BUTTON_PREV, .stable = 1, .last_raw = 1 };
+static page_button_t s_btn_next = { .pin = PIN_BUTTON_NEXT, .stable = 1, .last_raw = 1 };
 
 // 焦点页元素
 static lv_obj_t *lbl_focus_num, *lbl_focus_unit, *lbl_focus_sub, *lbl_focus_peak;
@@ -626,15 +689,16 @@ static void build_page_focus(lv_obj_t *pg) {
     lv_obj_set_pos(canvas_meteor, 12, 44);
     lv_canvas_set_draw_buf(canvas_meteor, &cvs_meteor);
 
-    lbl_focus_num = mk_label(pg, 12, 34, &lv_font_montserrat_48, CLR_TEXT);
+    lbl_focus_num = mk_label(pg, 12, 42, UI_FONT_METRIC, CLR_TEXT);
     lv_obj_set_width(lbl_focus_num, 296);
     lv_obj_set_style_text_align(lbl_focus_num, LV_TEXT_ALIGN_CENTER, 0);
+    lv_obj_set_style_text_letter_space(lbl_focus_num, 2, 0);
     lv_label_set_text(lbl_focus_num, "--");
     lbl_focus_unit = mk_label(pg, 12, 90, UI_FONT_META, CLR_DOWN);
     lv_obj_set_width(lbl_focus_unit, 296);
     lv_obj_set_style_text_align(lbl_focus_unit, LV_TEXT_ALIGN_CENTER, 0);
     lv_label_set_text(lbl_focus_unit, "MB/s");
-    // 使用原生 48px 字体，避免运行时缩放造成边缘模糊。
+    // 关键主值使用项目 2bpp 原生数字字体，避免 4bpp 灰边与运行时缩放。
     lbl_focus_sub = mk_label(pg, 12, 122, UI_FONT_META, CLR_DIM);
     lv_label_set_text(lbl_focus_sub, "UP -- MB/s");
     mk_block(pg, 12, 112, 296, 1, CLR_BORDER);
@@ -744,7 +808,7 @@ static void build_page_sys(lv_obj_t *pg) {
     sys_row(pg, 86, "HEAP",    CLR_PING,   &lbl_sys_heap);
     mk_block(pg, 12, 112, 296, 1, CLR_BORDER);
     lv_obj_t *hint = mk_label(pg, 12, 130, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(hint, "BOOT: NEXT / 2X HOME / HOLD SLEEP");
+    lv_label_set_text(hint, "BOOT PREV / IO14 NEXT");
 }
 
 
@@ -858,9 +922,8 @@ static void build_page_ac(lv_obj_t *pg) {
 
 
 // ── 夜间自动降背光:APP_NIGHT_START~APP_NIGHT_END 时段降到 APP_BL_NIGHT_PCT ──
-// 依赖 SNTP;时间未同步(年<2024)时不动作。手动息屏(s_bl_off)优先。
+// 依赖 SNTP;时间未同步(年<2024)时不动作。
 static void night_dim_poll(void) {
-    if (s_bl_off) return;                   // 手动息屏中,不干预
     time_t t = time(NULL);
     struct tm tm_;
     localtime_r(&t, &tm_);
@@ -874,58 +937,34 @@ static void night_dim_poll(void) {
         if (s_roll_timer) {
             lv_timer_set_period(s_roll_timer, night ? (1000 / 15) : (1000 / CURVE_FPS));
         }
-    }
-    if (lbl_source) {
-        lv_label_set_text(lbl_source, s_night_dim ? "NIGHT DIM" :
-                          (APP_DEMO_MODE ? "DEMO DATA" : "IKUAI LIVE"));
-        lv_obj_set_style_text_color(lbl_source,
-            lv_color_hex(s_night_dim ? CLR_YELLOW : CLR_DIM), 0);
+        refresh_source_label();
     }
 }
 
-// BOOT 键:单击=下一页,双击=回主页,长按(>1.2s)=息屏/唤醒(消抖 30ms)
-// 单击不立即执行:先挂起 260ms,期间若再次按下则判为双击
-static void boot_poll(void) {
-    static int stable = 1, last_raw = 1, deb = 0;
-    static uint32_t press_ms = 0;
-    static bool long_fired = false;
-    static bool pending = false;        // 有待执行的单击
-    static uint32_t pending_ms = 0;
+static bool button_pressed(page_button_t *button, uint32_t now) {
+    int raw = gpio_get_level(button->pin);
+    if (raw != button->last_raw) {
+        button->last_raw = raw;
+        button->changed_ms = now;
+        return false;
+    }
+    if (raw == button->stable || now - button->changed_ms < BUTTON_DEBOUNCE_MS) return false;
+
+    button->stable = raw;
+    return raw == 0;
+}
+
+// 两个物理按键各自只负责一个方向，按下稳定 30ms 后立即翻页。
+static void buttons_poll(void) {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
-    int raw = gpio_get_level(PIN_BOOT);
-    if (raw != last_raw) { last_raw = raw; deb = 0; s_last_key_ms = now; return; }
-    if (++deb < 6) return;              // 5ms*6=30ms 消抖
-    deb = 6;
-    if (raw != stable) {
-        stable = raw;
-        if (stable == 0) { press_ms = now; long_fired = false; }
-        else {
-            uint32_t dt = now - press_ms;
-            if (!long_fired && dt < 1200) {
-                if (pending && now - pending_ms < BUTTON_MULTI_CLICK_MS) {
-                    pending = false;    // 双击:直接回主页
-                    show_page(0, -1);
-                    button_feedback();
-                } else {
-                    pending = true;     // 单击待定,等双击窗口
-                    pending_ms = now;
-                }
-            }
-        }
-    }
-    if (pending && now - pending_ms >= BUTTON_MULTI_CLICK_MS) {
-        pending = false;
-        show_page((s_page + 1) % PAGE_COUNT, 1);
-        button_feedback();
-    }
-    if (stable == 0 && !long_fired && now - press_ms > BUTTON_HOLD_MS) {
-        long_fired = true;
-        pending = false;
-        s_bl_off = !s_bl_off;
-        s_night_dim = false;
-        lcd_set_backlight(s_bl_off ? 0 : APP_BL_PCT);
-        button_feedback();
-    }
+    bool prev = button_pressed(&s_btn_prev, now);
+    bool next = button_pressed(&s_btn_next, now);
+    if (prev == next) return;  // 无按键或同时按下时不改变页面。
+
+    s_last_key_ms = now;
+    if (prev) show_page((s_page + PAGE_COUNT - 1) % PAGE_COUNT, -1);
+    else show_page((s_page + 1) % PAGE_COUNT, 1);
+    button_feedback();
 }
 
 static void ui_create(void) {
@@ -939,14 +978,15 @@ static void ui_create(void) {
 
     dot_status = lv_obj_create(pg0);
     lv_obj_remove_style_all(dot_status);
-    lv_obj_set_style_bg_color(dot_status, lv_color_hex(CLR_GREEN), 0);
+    lv_obj_set_style_bg_color(dot_status,
+        lv_color_hex(APP_DEMO_MODE ? CLR_GREEN : CLR_DIM), 0);
     lv_obj_set_style_bg_opa(dot_status, LV_OPA_COVER, 0);
     lv_obj_set_style_radius(dot_status, 3, 0);
     lv_obj_set_pos(dot_status, 12, 9);
     lv_obj_set_size(dot_status, 6, 6);
 
     lbl_status = mk_label(pg0, 23, 1, UI_FONT_META, CLR_TEXT);
-    lv_label_set_text(lbl_status, "WAN ONLINE");
+    lv_label_set_text(lbl_status, APP_DEMO_MODE ? "DEMO ONLINE" : "WIFI CONNECTING");
 
     lbl_online = mk_label(pg0, 0, 1, UI_FONT_META, CLR_DIM);
     lv_label_set_text(lbl_online, "-- CLIENTS");
@@ -991,7 +1031,7 @@ static void ui_create(void) {
     lv_obj_set_size(graph, 296, 74);
 
     lbl_main_curve_state = mk_label(graph, 0, 1, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(lbl_main_curve_state, "10S LIVE");
+    lv_label_set_text(lbl_main_curve_state, APP_DEMO_MODE ? "10S DEMO" : "WARMING UP");
     // 图例:3px 色块 + 小字(色块即编码,不占胶囊)
     mk_block(graph, 78, 6, 3, 3, CLR_DOWN);
     lv_obj_t *legend_down = mk_label(graph, 85, 1, UI_FONT_META, CLR_DOWN);
@@ -1010,7 +1050,7 @@ static void ui_create(void) {
     lbl_ip = mk_label(pg0, 12, 153, UI_FONT_META, CLR_DIM);
     lv_label_set_text(lbl_ip, APP_DEMO_MODE ? "IP DEMO" : "IP ---");
     lbl_source = mk_label(pg0, 0, 153, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(lbl_source, APP_DEMO_MODE ? "DEMO DATA" : "IKUAI LIVE");
+    lv_label_set_text(lbl_source, APP_DEMO_MODE ? "DEMO DATA" : "IKUAI WAIT");
     lv_obj_align(lbl_source, LV_ALIGN_TOP_RIGHT, -12, 153);
 
     build_page_focus(s_pg[1]);
@@ -1036,8 +1076,19 @@ static void ui_create(void) {
     }
     show_page(0, 1);
 
-    gpio_config_t btn = { .pin_bit_mask = 1ULL << PIN_BOOT, .mode = GPIO_MODE_INPUT, .pull_up_en = 1 };
+    gpio_config_t btn = {
+        .pin_bit_mask = (1ULL << PIN_BUTTON_PREV) | (1ULL << PIN_BUTTON_NEXT),
+        .mode = GPIO_MODE_INPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
     gpio_config(&btn);
+
+    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    s_btn_prev.stable = s_btn_prev.last_raw = gpio_get_level(s_btn_prev.pin);
+    s_btn_next.stable = s_btn_next.last_raw = gpio_get_level(s_btn_next.pin);
+    s_btn_prev.changed_ms = s_btn_next.changed_ms = now;
 }
 
 // 静默降灰/活跃点亮:无流量时大数字降为深灰(30号站待机精神)
@@ -1070,6 +1121,55 @@ static void set_curve_state(const char *text, uint32_t color) {
         lv_label_set_text(lbl_curve_state, text);
         lv_obj_set_style_text_color(lbl_curve_state, lv_color_hex(color), 0);
     }
+}
+
+static uint32_t trust_color(data_trust_t trust) {
+    switch (trust) {
+        case DATA_TRUST_LIVE: return CLR_GREEN;
+        case DATA_TRUST_STALE: return CLR_PING;
+        case DATA_TRUST_TIMEOUT:
+        case DATA_TRUST_OFFLINE: return CLR_RED;
+        default: return CLR_DIM;
+    }
+}
+
+static const char *trust_source_text(data_trust_t trust) {
+    switch (trust) {
+        case DATA_TRUST_LIVE: return s_night_dim ? "LIVE | NIGHT" : "IKUAI LIVE";
+        case DATA_TRUST_STALE: return "IKUAI STALE";
+        case DATA_TRUST_TIMEOUT: return "IKUAI TIMEOUT";
+        case DATA_TRUST_OFFLINE: return "DATA OFFLINE";
+        case DATA_TRUST_DEMO: return s_night_dim ? "DEMO | NIGHT" : "DEMO DATA";
+        case DATA_TRUST_NO_DATA: return "NO DATA";
+        default: return "IKUAI WAIT";
+    }
+}
+
+static void refresh_source_label(void) {
+    if (!lbl_source) return;
+    lv_label_set_text(lbl_source, trust_source_text(s_data_trust));
+    uint32_t color = trust_color(s_data_trust);
+    if (s_night_dim && (s_data_trust == DATA_TRUST_LIVE || s_data_trust == DATA_TRUST_DEMO)) {
+        color = CLR_YELLOW;
+    }
+    lv_obj_set_style_text_color(lbl_source, lv_color_hex(color), 0);
+}
+
+static void set_curve_trust(data_trust_t trust, bool window_ready) {
+    s_data_trust = trust;
+    switch (trust) {
+        case DATA_TRUST_LIVE:
+            set_curve_state(window_ready ? "10S LIVE" : "WARMING UP",
+                            window_ready ? CLR_GREEN : CLR_DIM);
+            break;
+        case DATA_TRUST_STALE: set_curve_state("STALE", CLR_PING); break;
+        case DATA_TRUST_TIMEOUT: set_curve_state("TIMEOUT", CLR_RED); break;
+        case DATA_TRUST_OFFLINE: set_curve_state("OFFLINE", CLR_RED); break;
+        case DATA_TRUST_DEMO: set_curve_state("10S DEMO", CLR_DIM); break;
+        case DATA_TRUST_NO_DATA: set_curve_state("NO DATA", CLR_DIM); break;
+        default: set_curve_state("WARMING UP", CLR_DIM); break;
+    }
+    refresh_source_label();
 }
 
 static void link_failure_text(const char **detail, const char **footer) {
@@ -1212,7 +1312,7 @@ static void pages_update(void) {
         set_active_style(lbl_focus_num, lbl_focus_unit, CLR_DOWN, act);
         if (pk >= 1024) {
             char pv[16]; const char *pu;
-            fmt_rate(pk, pv, sizeof(pv), &pu);
+            fmt_rate(pk, &s_peak_unit, pv, sizeof(pv), &pu);
             char pl[40];
             snprintf(pl, sizeof(pl), "PEAK %s %s *", pv, pu);
             lv_label_set_text(lbl_focus_peak, pl);
@@ -1297,10 +1397,11 @@ static void pages_update(void) {
             if (clients_fresh && i < ex.client_cnt) {
                 lv_label_set_text(lbl_cli[i][0], ex.client[i].name);
                 char v[16]; const char *u;
-                fmt_rate(ex.client[i].down_bps, v, sizeof(v), &u);
+                fmt_rate(ex.client[i].down_bps, &s_client_unit[i], v, sizeof(v), &u);
                 snprintf(line, sizeof(line), "%s %s", v, u);
                 lv_label_set_text(lbl_cli[i][1], line);
             } else {
+                s_client_unit[i] = RATE_UNIT_AUTO;
                 lv_label_set_text(lbl_cli[i][0], clients_fresh ? "--" : "STALE");
                 lv_label_set_text(lbl_cli[i][1], clients_fresh ? "--" : "STALE");
             }
@@ -1364,8 +1465,8 @@ static void ui_update(void) {
 
     char d[16], u[16], line[32];
     const char *du, *uu;
-    fmt_rate(down_bps, d, sizeof(d), &du);
-    fmt_rate(up_bps, u, sizeof(u), &uu);
+    fmt_rate(down_bps, &s_down_unit, d, sizeof(d), &du);
+    fmt_rate(up_bps, &s_up_unit, u, sizeof(u), &uu);
     lv_label_set_text(lbl_down, d);
     lv_label_set_text(lbl_up, u);
     lv_label_set_text(lbl_down_unit, du);
@@ -1391,7 +1492,7 @@ static void ui_update(void) {
     s_track[TRACK_UP].target = (float)u_tri / 7.0f;
     s_track[TRACK_PING].target = ping_ms / 47.0f;
     meteor_note_rate(down_bps);
-    set_curve_state("10S DEMO", CLR_DIM);
+    set_curve_trust(DATA_TRUST_DEMO, true);
     pages_update();
     return;
 #endif
@@ -1404,8 +1505,8 @@ static void ui_update(void) {
     if (sys_ok) {
         char d[16], u[16];
         const char *du, *uu;
-        fmt_rate(s.down_bps, d, sizeof(d), &du);
-        fmt_rate(s.up_bps, u, sizeof(u), &uu);
+        fmt_rate(s.down_bps, &s_down_unit, d, sizeof(d), &du);
+        fmt_rate(s.up_bps, &s_up_unit, u, sizeof(u), &uu);
         lv_label_set_text(lbl_down, d);
         lv_label_set_text(lbl_up, u);
         lv_label_set_text(lbl_down_unit, du);
@@ -1451,6 +1552,8 @@ static void ui_update(void) {
         lv_obj_set_style_bg_color(dot_status, lv_color_hex(CLR_RED), 0);
         s_last_active = false;
         s_up_active = false;
+        s_down_unit = RATE_UNIT_AUTO;
+        s_up_unit = RATE_UNIT_AUTO;
         strncpy(s_last_d, "--", sizeof(s_last_d));
         strncpy(s_last_u, "--", sizeof(s_last_u));
         s_last_du = "";
@@ -1465,8 +1568,9 @@ static void ui_update(void) {
     }
 
     if (ikuai_get_curve(&c) && c.n > 0) {
-        set_curve_state(!sys_ok ? "STALE" : (c.n < 10 ? "WARMING UP" : "10S LIVE"),
-                        !sys_ok ? CLR_RED : (c.n < 10 ? CLR_DIM : CLR_GREEN));
+        set_curve_trust(!sys_ok ? DATA_TRUST_STALE :
+                        (c.n < 10 ? DATA_TRUST_WARMING : DATA_TRUST_LIVE),
+                        c.n >= 10);
         int slot = (c.head - 1 + IKUAI_CURVE_MAX) % IKUAI_CURVE_MAX;
         float p = c.ping_ms[slot];
         if (p < 0) {
@@ -1490,7 +1594,8 @@ static void ui_update(void) {
         lv_label_set_text(lbl_ping, "GW -- MS");
         set_ping_style(-1);
         s_last_ping_ms = -1;
-        set_curve_state(sys_ok ? "NO DATA" : "TIMEOUT", sys_ok ? CLR_DIM : CLR_RED);
+        set_curve_trust(sys_ok ? DATA_TRUST_NO_DATA :
+                        (s_wifi_ok ? DATA_TRUST_TIMEOUT : DATA_TRUST_OFFLINE), false);
         s_track[TRACK_PING].target = 0;
     }
 
@@ -1577,6 +1682,18 @@ static void ui_task(void *arg) {
         bu[i] = s_c_bg;
     }
 
+    // Render the initial black/background frame while the backlight is still
+    // off, then enable it only after the i80 transfer has completed.
+    lv_refr_now(lv_display_get_default());
+    bool backlight_ready = lv_port_disp_wait_first_flush(1000);
+    if (backlight_ready) {
+        lcd_set_backlight(APP_BL_PCT);
+    } else {
+        // Fail dark instead of exposing unknown GRAM. The UI task keeps
+        // running and will recover if a late transfer eventually completes.
+        ESP_LOGE(TAG, "first display flush timed out; waiting with backlight off");
+    }
+
     const esp_timer_create_args_t tmr_args = { .callback = lv_tick_cb, .name = "lv_tick" };
     esp_timer_handle_t tmr;
     ESP_ERROR_CHECK(esp_timer_create(&tmr_args, &tmr));
@@ -1586,7 +1703,12 @@ static void ui_task(void *arg) {
     s_roll_timer = lv_timer_create(roll_timer_cb, 1000 / CURVE_FPS, NULL);
 
     for (;;) {
-        boot_poll();
+        if (!backlight_ready && lv_port_disp_first_flush_done()) {
+            backlight_ready = true;
+            lcd_set_backlight(APP_BL_PCT);
+            ESP_LOGW(TAG, "late first display flush completed; backlight enabled");
+        }
+        buttons_poll();
         lv_timer_handler();
         // Give IDLE0 enough scheduling time on the 160 MHz default clock;
         // LVGL software rendering still runs at its configured 33 ms period.

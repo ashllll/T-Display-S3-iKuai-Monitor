@@ -202,13 +202,16 @@ void lcd_init(void) {
     ESP_ERROR_CHECK(esp_lcd_panel_set_gap(s_panel, X_GAP, Y_GAP));
     ESP_ERROR_CHECK(esp_lcd_panel_swap_xy(s_panel, true));   // 横屏 320x170
     ESP_ERROR_CHECK(esp_lcd_panel_mirror(s_panel, false, true));
-    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
-
+    // Apply the board-specific ST7789V extension registers before enabling
+    // the panel output.  The backlight remains off until the first LVGL frame
+    // is transferred, so no uninitialised GRAM is visible during boot.
     for (size_t i = 0; i < sizeof(s_st7789_init) / sizeof(s_st7789_init[0]); i++) {
         const st7789_cmd_t *cmd = &s_st7789_init[i];
         ESP_ERROR_CHECK(esp_lcd_panel_io_tx_param(io, cmd->cmd, cmd->data, cmd->len & 0x7F));
         if (cmd->len & 0x80) vTaskDelay(pdMS_TO_TICKS(120));
     }
+
+    ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
 
     bl_init();
     ESP_LOGI(TAG, "LCD ready");

@@ -35,7 +35,7 @@ Extended endpoints rotate one request every three seconds to keep router load lo
 
 The monitor marks each extended data source independently as live or stale instead of presenting old WAN/client/AC values as current. Realtime throughput uses iKuai's instantaneous `stream.download` and `stream.upload` fields directly; cumulative `total_down` and `total_up` are not differenced into a second rate. The UI formats the direct value as `B/s`, `KB/s`, or `MB/s`, and the ping label is `GW` because it measures the local gateway, not an Internet speed test.
 
-BOOT (GPIO0): single press changes page, double press returns home, and long press toggles the display. The single/double decision window is 260 ms and the active page dot briefly flashes to confirm a key event. Wi-Fi reconnects with exponential backoff (up to 30 s) instead of hammering the access point. The UI returns home after 60 seconds without input.
+The two physical buttons have dedicated directions: BOOT (GPIO0) goes to the previous page and IO14 (GPIO14) goes to the next page. Each action fires after 30 ms debounce with no multi-click or hold delay; the active page dot briefly flashes as feedback. Bidirectional movement caps navigation across the ten pages at five steps. Wi-Fi reconnects with exponential backoff (up to 30 s) instead of hammering the access point. The UI returns home after 60 seconds without input.
 
 Day brightness is configurable from 0–100% and defaults to 45% in the tracked template; SNTP-based night dimming defaults to 12% from 23:00–07:00. The home footer changes to `NIGHT DIM` while the scheduled dim level is active.
 
@@ -46,7 +46,8 @@ Day brightness is configurable from 0–100% and defaults to 45% in the tracked 
 - Peripheral power: GPIO15; pull it high before LCD initialization
 - LCD data: GPIO39/40/41/42/45/46/47/48
 - LCD control: RST GPIO5, CS GPIO6, DC GPIO7, WR GPIO8, backlight GPIO38
-- BOOT button: GPIO0
+- Previous-page button: BOOT, GPIO0
+- Next-page button: IO14, GPIO14
 
 The monitor uses the ESP-IDF `esp_lcd` driver and LVGL 9. The iKuai firmware entry point is `examples/ikuai_widget`; other Arduino/LVGL 8 examples are outside this project's runtime path.
 

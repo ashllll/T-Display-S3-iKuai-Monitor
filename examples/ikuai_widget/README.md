@@ -2,7 +2,7 @@
 
 面向 T-Display-S3（非触摸版）的桌面监控摆件固件：LVGL 界面实时显示 iKuai 路由器 WAN 状态、上下行速率与滚动趋势曲线。UI 采用酷态科（CUKTECH）小屏设计语言：纯黑底 + 原生清晰数字 + 彩色胶囊标签 + 无网格渐变曲线；主页使用 D-DIN Italic，速率焦点页使用原生 48px 数字避免缩放模糊。
 
-本目录是 T-Display-S3 的独立监控固件入口，面向板载 ST7789 屏幕和 GPIO0 BOOT 按键。
+本目录是 T-Display-S3 的独立监控固件入口，面向板载 ST7789 屏幕以及 GPIO0、GPIO14 两个物理按键。
 
 ## 最新 UI 更新 / Latest UI update
 
@@ -19,7 +19,7 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 
 ## 页面与按键
 
-设备为**十页单键翻页**结构（酷态科“一屏一焦点”原则），底部居中 10 个页码点（黄=当前页）：
+设备为**十页双键翻页**结构（酷态科“一屏一焦点”原则），底部居中 10 个页码点（黄=当前页）：
 
 | 页 | 内容 | 数据源（iKuai v4.0 API） |
 |---|---|---|
@@ -36,7 +36,7 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 
 > 扩展端点采用**轮转制**：每 3 秒只发一个额外请求（WAN → 终端 → AC 循环），不给路由器加压力；AC 未开启时第 10 页显示 OFF 且不再请求无线统计。
 
-**BOOT 键（GPIO0）**：单击 = 下一页（260ms 双击窗口内第二次按下 = 直接回主页，当前页码点会短暂闪亮）；长按 1.2s = 息屏/唤醒（背光 0 ↔ 配置值）。消抖 30ms。**60 秒无操作自动回主页**。
+**BOOT 键（GPIO0）= 上一页；IO14 键（GPIO14）= 下一页。** 两个按键各自只负责一个方向，按下经 30ms 消抖后立即响应，不等待双击窗口，也不区分短按/长按。双向翻页把十页系统的最坏导航成本限制在 5 次，当前页码点会短暂闪亮作为反馈。**60 秒无操作自动回主页**。
 
 ## 动态行为（酷态科语言的灵魂细节）
 
@@ -46,13 +46,13 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 - **焦点页峰值标记**：会话峰值以 `PEAK x.x MB/s *` 黄字常驻（模式 C 规格）
 - **翻页方向感动画**：向前翻从右滑入，回翻从左滑入
 - **焦点页流星汇入**：仅在流量明显变化时短暂出现 6 颗青/蓝流星，避免持续粒子遮挡主数字；设置 `APP_REDUCED_MOTION=1` 可关闭页面滑动和流星动效
-- **夜间静音模式**：SNTP 授时（ntp.aliyun.com，CST-8）后，23:00–07:00 背光自动降到 `APP_BL_NIGHT_PCT`（模板默认 12%），主页显示 `NIGHT DIM`，曲线保持 15 FPS，并关闭流星和翻页动效；时段可在 `config.h` 改，手动息屏优先，时间未同步时不动作
+- **夜间静音模式**：SNTP 授时（ntp.aliyun.com，CST-8）后，23:00–07:00 背光自动降到 `APP_BL_NIGHT_PCT`（模板默认 12%），主页显示 `NIGHT DIM`，曲线保持 15 FPS，并关闭流星和翻页动效；时段可在 `config.h` 改，时间未同步时不动作
 
 ## 硬件
 
 - **主控**：ESP32-S3R8（Wi-Fi / BLE，16MB Flash，8MB OPI PSRAM）
 - **屏幕**：ST7789，170×320，**8-bit 并口（i80，非 SPI）**
-- **按键**：BOOT（GPIO0），单键完成翻页、回主页和息屏/唤醒
+- **按键**：BOOT（GPIO0）固定上一页；IO14（GPIO14）固定下一页
 
 ## ⚠ 重点注意事项（移植/烧录前必读）
 
@@ -62,7 +62,7 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 4. **外部供电（非 USB-C）时必须禁用 USB CDC**，否则开机等待串口连接、程序不启动：取消 `platformio.ini` 中 `build_flags` 注释即可。
 5. **烧录失败时手动进下载模式**：按住 BOOT → 按一下 RST → 松开 RST → 松开 BOOT，然后重新 upload。
 6. **分辨率**：屏幕按横屏 320×170 适配（底部信息行紧贴下边缘，改布局时注意）。
-7. **状态不依赖额外外设**：本固件只使用屏幕和 BOOT 键；在线状态由屏幕状态点与文案显示。
+7. **状态不依赖额外外设**：本固件只使用屏幕和板载 BOOT/IO14 按键；在线状态由屏幕状态点与文案显示。
 
 ## 功能
 
