@@ -44,9 +44,9 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 - **PING 胶囊变色**：正常 = 橙描边；延迟 ≥ 80ms 或超时 = 红色——不看数字先读色
 - **下行曲线渐变填充**：30号站同款 sparkline，亮线 + 向下渐淡填充，不覆盖其他轨道
 - **焦点页峰值标记**：会话峰值以 `PEAK x.x MB/s *` 黄字常驻（模式 C 规格）
-- **翻页方向感动画**：向前翻从右滑入，回翻从左滑入
-- **焦点页流星汇入**：仅在流量明显变化时短暂出现 6 颗青/蓝流星，避免持续粒子遮挡主数字；设置 `APP_REDUCED_MOTION=1` 可关闭页面滑动和流星动效
-- **夜间静音模式**：SNTP 授时（ntp.aliyun.com，CST-8）后，23:00–07:00 背光自动降到 `APP_BL_NIGHT_PCT`（模板默认 12%），主页显示 `NIGHT DIM`，曲线保持 15 FPS，并关闭流星和翻页动效；时段可在 `config.h` 改，时间未同步时不动作
+- **原子换页**：切页先清除上一页的完整组合，再显示目标页并整屏刷新，避免 partial buffer 屏幕留下前一页残影
+- **焦点页流星汇入**：仅在流量明显变化时短暂出现 6 颗青/蓝流星，避免持续粒子遮挡主数字；设置 `APP_REDUCED_MOTION=1` 可关闭流星动效
+- **夜间静音模式**：SNTP 授时（ntp.aliyun.com，CST-8）后，23:00–07:00 背光自动降到 `APP_BL_NIGHT_PCT`（模板默认 12%），主页显示 `NIGHT DIM`，曲线保持 15 FPS，并关闭流星动效；时段可在 `config.h` 改，时间未同步时不动作
 
 ## 硬件
 
@@ -84,7 +84,7 @@ pio run -e t-display-s3 -t upload
 pio device monitor
 ```
 
-`APP_REDUCED_MOTION=1` 可关闭页面滑动和流星动效，保留曲线滚动，适合对动效敏感或需要更安静显示的场景。最新实机验证记录见仓库根目录 [`CHANGELOG.md`](../../CHANGELOG.md)。
+`APP_REDUCED_MOTION=1` 可关闭流星动效，保留原子换页和曲线滚动，适合对动效敏感或需要更安静显示的场景。最新实机验证记录见仓库根目录 [`CHANGELOG.md`](../../CHANGELOG.md)。
 
 LVGL 9.2.2 由 `src/idf_component.yml` 管理，版本锁定在 `dependencies.lock`；`components/lv_conf.h` 是本板的精简配置。`src/config.h`、`src/ikuai_cert.h`、构建目录和生成的 `sdkconfig` 均为本地文件，不要提交。
 

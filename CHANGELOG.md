@@ -9,6 +9,7 @@
 - 将 `WARMING/LIVE/STALE/TIMEOUT/OFFLINE/DEMO/NO DATA` 收敛为统一数据可信度模型；`STALE` 使用橙色提醒，不再冒充红色故障。
 - 吞吐单位增加 768/1152 回切迟滞，降低阈值附近 `KB/s` 与 `MB/s` 反复切换。
 - 将两个板载按键改为固定方向：BOOT/GPIO0 上一页、IO14/GPIO14 下一页；移除多击窗口与按压时长判断，30ms 消抖后立即响应，十页系统最多五步可达。
+- 修复切页时上一页残留：移除旧页/新页同时平移的 190ms 动画，改为隐藏全部旧页、显示目标页并整屏失效，适配 LVGL partial buffer。
 
 ### English
 
@@ -17,6 +18,7 @@
 - Centralized `WARMING/LIVE/STALE/TIMEOUT/OFFLINE/DEMO/NO DATA` as data-trust states; stale data now uses warning orange rather than fault red.
 - Added 768/1152 unit hysteresis to prevent repeated `KB/s` and `MB/s` switching near thresholds.
 - Assigned the two onboard buttons dedicated directions: BOOT/GPIO0 for previous and IO14/GPIO14 for next. Removing multi-click and hold timing makes navigation respond immediately after 30 ms debounce while keeping every page within five steps.
+- Fixed previous-page ghosts during navigation by removing the 190 ms two-page translate animation and switching atomically to one visible page followed by a full-screen invalidation for the LVGL partial buffer.
 
 ### Validation boundary / 验证边界
 

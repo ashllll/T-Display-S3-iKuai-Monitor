@@ -602,64 +602,24 @@ static lv_obj_t *lbl_cli[3][2];   // [i][0=名称 1=速率]
 static lv_obj_t *lbl_top_count, *lbl_top_total;
 static lv_obj_t *lbl_ac, *lbl_ap, *lbl_clt_2g, *lbl_clt_5g;
 
-static void page_translate_x(void *var, int32_t value) {
-    lv_obj_set_style_translate_x((lv_obj_t *)var, value, 0);
-}
-
-static void page_hide_after_slide(lv_anim_t *a) {
-    lv_obj_t *pg = (lv_obj_t *)a->var;
-    lv_obj_add_flag(pg, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_translate_x(pg, 0, 0);
-    lv_obj_invalidate(lv_scr_act());
-}
-
-static void page_slide(lv_obj_t *pg, int32_t from, int32_t to, bool hide_when_done) {
-    lv_anim_delete(pg, page_translate_x);
-    lv_obj_remove_flag(pg, LV_OBJ_FLAG_HIDDEN);
-    lv_obj_set_style_translate_x(pg, from, 0);
-
-    if (APP_REDUCED_MOTION || s_night_dim) {
-        page_translate_x(pg, to);
-        if (hide_when_done) {
-            lv_obj_add_flag(pg, LV_OBJ_FLAG_HIDDEN);
-            page_translate_x(pg, 0);
-        }
-        lv_obj_invalidate(lv_scr_act());
-        return;
-    }
-
-    lv_anim_t a;
-    lv_anim_init(&a);
-    lv_anim_set_var(&a, pg);
-    lv_anim_set_values(&a, from, to);
-    lv_anim_set_duration(&a, 190);
-    lv_anim_set_exec_cb(&a, page_translate_x);
-    lv_anim_set_path_cb(&a, lv_anim_path_custom_bezier3);
-    lv_anim_set_bezier3_param(&a,
-        LV_BEZIER_VAL_FLOAT(0.23f), LV_BEZIER_VAL_FLOAT(1.0f),
-        LV_BEZIER_VAL_FLOAT(0.32f), LV_BEZIER_VAL_FLOAT(1.0f));
-    if (hide_when_done) lv_anim_set_completed_cb(&a, page_hide_after_slide);
-    lv_anim_start(&a);
-}
-
 static void show_page(int idx, int dir) {
     if (idx < 0 || idx >= PAGE_COUNT || idx == s_page) return;
-    lv_obj_t *old = (s_page >= 0 && s_page < PAGE_COUNT) ? s_pg[s_page] : NULL;
-    lv_obj_t *next = s_pg[idx];
+    (void)dir;  // 页面切换采用原子换页，方向只保留给按键语义和调用方。
 
     for (int i = 0; i < PAGE_COUNT; i++) {
-        lv_anim_delete(s_pg[i], page_translate_x);
-        if (s_pg[i] != old && s_pg[i] != next) {
-            lv_obj_add_flag(s_pg[i], LV_OBJ_FLAG_HIDDEN);
-            lv_obj_set_style_translate_x(s_pg[i], 0, 0);
-        }
+        lv_obj_add_flag(s_pg[i], LV_OBJ_FLAG_HIDDEN);
+        lv_obj_set_style_translate_x(s_pg[i], 0, 0);
         // 页码指示点:当前页=强调黄,其余=灰(颜色即编码)
         lv_obj_set_style_bg_color(s_dots[i],
             lv_color_hex(i == idx ? CLR_YELLOW : 0x3A4150), 0);
     }
 
-    if (old) page_slide(old, 0, -dir * 48, true);
-    page_slide(next, dir * 48, 0, false);
+    // Partial-buffer LCD cannot safely retain two full-page compositions while
+    // translating them. Hide every old page first, then expose the target at
+    // zero offset so the next full-screen invalidation has a single stable
+    // composition and cannot leave a previous-page ghost behind.
+    lv_obj_remove_flag(s_pg[idx], LV_OBJ_FLAG_HIDDEN);
+    lv_obj_set_style_translate_x(s_pg[idx], 0, 0);
     s_page = idx;
     // Partial buffers need a full-screen redraw after page composition changes.
     lv_obj_invalidate(lv_scr_act());
