@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="700" height="1140" viewBox="0 0 700 1140" role="img" aria-labelledby="title desc">
-  <title id="title">CUKTECH network monitor UI concepts</title>
-  <desc id="desc">Ten 320 by 170 landscape UI concepts for the T-Display-S3 iKuai network monitor.</desc>
+  <title id="title">Legacy CUKTECH network monitor UI explorations</title>
+  <desc id="desc">Archived 320 by 170 layout explorations. This file is not the current firmware page contract; use cuktech-ui-10-versions-v2.svg for the current ten-page overview.</desc>
   <style>
     .sheet{fill:#111}
     .screen{fill:#000;stroke:#2a2f35;stroke-width:1}
@@ -15,6 +15,7 @@
     .screen-label{font-family:Arial,sans-serif;font-size:13px;fill:#8a93a3}
   </style>
   <rect class="sheet" width="700" height="1140"/>
+  <text class="screen-label" x="680" y="16" text-anchor="end">LEGACY EXPLORATION · CURRENT CONTRACT: V2</text>
 
   <!-- 01 balanced monitor -->
   <g transform="translate(20 35)">
@@ -27,7 +28,7 @@
     <text class="text" x="12" y="70" font-size="34" font-style="italic">9.36</text><text class="cyan" x="103" y="66" font-size="12">MB/s</text>
     <text class="text" x="172" y="70" font-size="34" font-style="italic">1.02</text><text class="blue" x="263" y="66" font-size="12">MB/s</text>
     <line class="line" x1="12" y1="82" x2="308" y2="82"/>
-    <text class="dim" x="12" y="98" font-size="11">10S LIVE</text><path class="curve-cyan" d="M12 125 C40 102 58 110 82 120 S124 135 148 115 S193 100 218 118 S270 132 308 108"/>
+    <text class="dim" x="12" y="98" font-size="11">20S LIVE</text><path class="curve-cyan" d="M12 125 C40 102 58 110 82 120 S124 135 148 115 S193 100 218 118 S270 132 308 108"/>
     <path class="curve-blue" d="M12 142 C70 140 120 143 170 140 S260 142 308 139"/>
     <text class="dim" x="12" y="163" font-size="10">IP 192.168.9.2</text><text class="dim" x="308" y="163" text-anchor="end" font-size="10">IKUAI LIVE</text>
   </g>
@@ -53,7 +54,7 @@
     <path class="curve-cyan" d="M24 126 C47 110 62 130 83 116 S119 122 144 108"/>
     <text class="blue" x="176" y="45" font-size="11">UP</text><text class="text" x="176" y="83" font-size="36" font-style="italic">1.02</text><text class="blue" x="176" y="101" font-size="11">MB/s</text>
     <path class="curve-blue" d="M176 126 C201 122 224 128 244 119 S279 124 296 116"/>
-    <text class="dim" x="12" y="161" font-size="10">10S LIVE</text><text class="dim" x="308" y="161" text-anchor="end" font-size="10">IP 192.168.9.2</text>
+    <text class="dim" x="12" y="161" font-size="10">20S LIVE</text><text class="dim" x="308" y="161" text-anchor="end" font-size="10">IP 192.168.9.2</text>
   </g>
 
   <!-- 04 trend first -->
@@ -123,7 +124,7 @@
     <text class="dim" x="12" y="17" font-size="11">● ONLINE</text><text class="idle" x="308" y="17" text-anchor="end" font-size="11">23:42 · NIGHT</text>
     <text class="idle" x="12" y="55" font-size="10">DOWN</text><text class="text" x="12" y="96" font-size="42" font-style="italic">9.36</text><text class="idle" x="116" y="91" font-size="11">MB/s</text>
     <text class="dim" x="12" y="121" font-size="11">UP 1.02 MB/s</text><text class="idle" x="308" y="121" text-anchor="end" font-size="11">PING 8 MS</text>
-    <line class="line" x1="12" y1="137" x2="308" y2="137"/><text class="idle" x="12" y="158" font-size="10">10S LIVE</text><text class="idle" x="308" y="158" text-anchor="end" font-size="10">LOW MOTION</text>
+    <line class="line" x1="12" y1="137" x2="308" y2="137"/><text class="idle" x="12" y="158" font-size="10">20S LIVE</text><text class="idle" x="308" y="158" text-anchor="end" font-size="10">LOW MOTION</text>
   </g>
 
   <!-- 10 one question carousel -->

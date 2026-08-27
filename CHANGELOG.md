@@ -1,5 +1,55 @@
 # Changelog / 变更日志
 
+## 2026-08-26 — Router load and extended telemetry
+
+### 中文
+
+- 第 6 页由 ESP32 本机调试信息改为路由负载：总连接数、TCP/UDP/ICMP、在线客户端、网关丢包与抖动。
+- 网络健康页新增 60 点窗口丢包率、平均延迟和相邻有效样本抖动，并按证据区分丢包、高延迟和链路不稳。
+- WAN 页合并 `iface_check` 与 `iface_stream`，显示分线路实时上下行、连接数、累计量和收发丢包；未配置的第二 WAN 显示 `UNUSED`，不再误报离线。
+- 终端排行增加上传速率；路由健康页改为路由累计 RX/TX；无线页增加活跃、空闲和历史峰值终端数。
+- 扩展数据仍每 3 秒只请求一类，同一数据源约 9 秒更新；可信窗口据此调整为 20 秒，并修复 AC 统计失败时旧数据被重新标记为实时的问题。
+- 重绘第 7–10 页预览并同步完整十页 v2 总览；旧概念稿明确标记为 legacy，不再与当前固件页面合同混淆。
+- 修复路由温度空数组被误当成 `0 C`：兼容数字/字符串数组；当前接口没有温度样本时明确显示 `NO DATA`，不以 ESP32 本机温度冒充路由器温度。
+- 修复 Top Clients 因 JSON 字段顺序导致上下行恒为 0，并把 WAN、CPU/MEM、连接数、累计量、运行时间和版本字段改为独立有效性判定；字段缺失不再冒充真实零值。
+- 全局 WAN 状态改由线路检查结果驱动，WAN 对象解析严格限制在各自 JSON 边界；AC 正常关闭使用灰色待机语义，背光在面板上电前即被主动拉低。
+
+### English
+
+- Replaced the ESP32 debug page with router load: total, TCP, UDP, and ICMP sessions, online clients, gateway loss, and jitter.
+- Added 60-sample loss, average latency, and adjacent-valid-sample jitter evidence to Network Health, with distinct conclusions for loss, latency, and instability.
+- Merged `iface_check` and `iface_stream` on the WAN page for per-line live rates, sessions, totals, and dropped packets; an unconfigured second WAN now reads `UNUSED` instead of false offline.
+- Added upload rate to Top Clients, router cumulative RX/TX to Router Health, and active, idle, and peak client counts to Wireless AC.
+- Kept one extended request every three seconds, yielding about nine seconds per source; adjusted freshness to 20 seconds and fixed stale AC statistics being relabeled live after a failed statistics response.
+- Redrew the pages 7–10 preview and synchronized the complete ten-page v2 overview; the older concept sheet is explicitly marked legacy instead of posing as the firmware contract.
+- Fixed an empty router-temperature array being misread as `0 C`: numeric and quoted arrays are accepted, while a missing sample now reads `NO DATA` rather than substituting the ESP32's own temperature.
+- Fixed Top Clients rates being forced to zero by JSON key order, and added independent validity contracts for WAN, CPU/memory, session counts, totals, uptime, and version fields so missing data cannot masquerade as a real zero.
+- Drove global WAN state from line-check results, bounded every WAN parse to its own JSON object, rendered an intentionally disabled AC as idle instead of failed, and asserted backlight-off before panel power-up.
+
+### Validation boundary / 验证边界
+
+PlatformIO completed with 90,948 bytes RAM and 1,173,661 bytes Flash. OpenOCD selected the Espressif USB-JTAG device with serial `AC:A7:04:F6:68:D4`, independently wrote and verified bootloader, partition table, and the Live application, then reset the board. The reset capture passed the 8 MB PSRAM test, recovered from expected pre-DHCP connection attempts to HTTP 200, and anonymously confirmed three client rows, AC-off state, and two WAN status/stream pairs. A following steady-state sample reached `curve_fps=15.0`, with 86,879 bytes internal RAM free and a 31,744-byte largest block; no panic, assert, abort, or reboot appeared. Direct observation is still required for clipping, semantic colors, and rapid page switching on pages 6–10. Router addresses, client names, and credentials are not logged.
+
+## 2026-08-26 — Real-time trend clock and PSRAM headroom
+
+### 中文
+
+- 曲线弹簧保持固定 15 Hz 临界阻尼步长，横轴按真实经过时间累计；LVGL 回调偶发延迟时补齐列数，使 300px 全宽趋势仍对应约 20 秒。
+- 将五个 CPU 绘制用 Canvas 历史缓冲区和 8KB HTTP 响应缓冲区显式迁移到 PSRAM；LCD i80 DMA 缓冲继续保留在内部 RAM。
+- HEAP 页面和 30 秒日志改为报告真正稀缺的内部 RAM、最小值与最大连续块，不再让 8MB PSRAM 掩盖内部内存压力。
+- JSON 轻量解析器的固定搜索窗口收口到响应字符串终点，截断或格式变化时不再构造越过 NUL 的窗口。
+
+### English
+
+- Kept the curve spring on a fixed 15 Hz critically damped step while accumulating real elapsed time for horizontal columns, preserving the approximately 20-second meaning of the 300 px trend under LVGL callback jitter.
+- Moved five CPU-rendered canvas-history buffers and the 8 KB HTTP response buffer explicitly to PSRAM while keeping the LCD i80 DMA buffers in internal RAM.
+- Changed the HEAP page and 30-second telemetry to report scarce internal RAM, its minimum, and largest contiguous block instead of hiding pressure behind the 8 MB PSRAM total.
+- Clamped the lightweight JSON parser's fixed search windows to each response's terminating NUL so truncated or changed payloads cannot create out-of-string boundaries.
+
+### Validation boundary / 验证边界
+
+USB-JTAG flashed and independently verified the bootloader, partition table, and Live application, then reset the board. Runtime logs confirmed the 8 MB PSRAM test, the 8 KB response buffer in PSRAM, Wi-Fi/IP acquisition, a live iKuai HTTP 200 response, and a steady second-window `curve_fps=15.0`. Internal free RAM settled at 87,767 bytes with a 31,744-byte largest block; the 40-second steady-state capture showed no error, panic, assert, or reboot. Initial HTTP connection errors occurred before DHCP completed and recovered automatically. Direct observation is still required for startup artifacts, button feedback, rapid page switching, and any visible two-column catch-up stutter.
+
 ## 2026-08-23 — Rendering, trust state, and navigation hardening
 
 ### 中文

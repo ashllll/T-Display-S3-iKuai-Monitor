@@ -35,7 +35,7 @@ text { font-family:"D-DIN",ui-monospace,monospace; }
     <rect x="10" y="78" width="300" height="1" fill="#1C222B"/>
 
     <!-- 趋势区标题与图例(3px 色块+小字) -->
-    <text x="11" y="95" font-size="12" fill="#8A93A3">10S LIVE</text>
+    <text x="11" y="95" font-size="12" fill="#8A93A3">20S LIVE</text>
     <rect x="88" y="88" width="3" height="3" fill="#37C4D6"/>
     <text x="95" y="95" font-size="12" fill="#37C4D6">DOWN</text>
     <rect x="152" y="88" width="3" height="3" fill="#3FA9F5"/>

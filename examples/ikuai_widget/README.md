@@ -1,6 +1,6 @@
 # T-Display-S3 iKuai 网络监控屏 / iKuai Network Monitor
 
-面向 T-Display-S3（非触摸版）的桌面监控摆件固件：LVGL 界面实时显示 iKuai 路由器 WAN 状态、上下行速率与滚动趋势曲线。UI 采用酷态科（CUKTECH）小屏设计语言：纯黑底 + 原生清晰数字 + 彩色胶囊标签 + 无网格渐变曲线；主页使用 D-DIN Italic，速率焦点页使用原生 48px 数字避免缩放模糊。
+面向 T-Display-S3（非触摸版）的桌面监控摆件固件：LVGL 界面实时显示 iKuai 路由器 WAN 状态、上下行速率与滚动趋势曲线。UI 采用酷态科（CUKTECH）小屏设计语言：纯黑底 + 像素对齐数字 + 彩色胶囊标签 + 无网格渐变曲线；主页和速率焦点页均使用不缩放的 36px 数字字体，避免插值模糊。
 
 本目录是 T-Display-S3 的独立监控固件入口，面向板载 ST7789 屏幕以及 GPIO0、GPIO14 两个物理按键。
 
@@ -28,13 +28,13 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 | 3 | 双通道页：上下行双大数字 + 两条独立微型趋势曲线 | 同上 |
 | 4 | 趋势优先页：300×108 无网格三色滚动曲线 + 当前数值 | 同上 + ICMP ping |
 | 5 | 网络健康页：WAN 状态结论 + PING/上下行证据 + 告警建议 | 同上 + 本地 Wi-Fi 状态 |
-| 6 | 本机状态页：IP / CLIENTS / DEVICE UP / HEAP 胶囊行 | 本地 |
-| 7 | 路由健康页：CPU/内存双大数字 + 温度 + 运行时间 + 客户端/堆内存/版本 | monitoring/system 附带字段（零额外请求） |
-| 8 | WAN 线路详情页：双线路公网 IP / 网关 / 在线状态词与状态点 | monitoring/interfaces-status（3s 轮转） |
-| 9 | 终端流量排行页：下行 Top3 + 在线数 + 总上下行摘要 | monitoring/clients-online（3s 轮转） |
-| 10 | 无线 AC 状态页：AC 开关 / AP 在线数 / 2.4G·5G 终端大数字 | network/ac/services + monitoring/wireless-statistics（3s 轮转） |
+| 6 | 路由负载页：总连接数 + TCP/UDP/ICMP + 客户端/丢包/抖动 | monitoring/system + ICMP |
+| 7 | 路由健康页：CPU/内存 + 温度 + 运行时间 + 累计 RX/TX + 版本 | monitoring/system 附带字段（零额外请求） |
+| 8 | WAN 线路详情页：状态 + 实时 D/U + 连接数 + 丢包 + 公网 IP | monitoring/interfaces-status（同源约 9s 更新） |
+| 9 | 终端流量排行页：Top3 分别显示实时下载与上传 | monitoring/clients-online（同源约 9s 更新） |
+| 10 | 无线 AC 状态页：AC/AP/2.4G·5G + 活跃/空闲/峰值 | network/ac/services + monitoring/wireless-statistics（同源约 9s 更新） |
 
-> 扩展端点采用**轮转制**：每 3 秒只发一个额外请求（WAN → 终端 → AC 循环），不给路由器加压力；AC 未开启时第 10 页显示 OFF 且不再请求无线统计。
+> 扩展端点采用**轮转制**：每 3 秒只发一个额外请求（WAN → 终端 → AC 循环），所以同一数据源约 9 秒更新一次，连续 20 秒未成功刷新则显示 `STALE`；AC 未开启时第 10 页显示 OFF 且不再请求无线统计。
 
 **BOOT 键（GPIO0）= 上一页；IO14 键（GPIO14）= 下一页。** 两个按键各自只负责一个方向，按下经 30ms 消抖后立即响应，不等待双击窗口，也不区分短按/长按。双向翻页把十页系统的最坏导航成本限制在 5 次，当前页码点会短暂闪亮作为反馈。**60 秒无操作自动回主页**。
 
@@ -66,35 +66,41 @@ Each extended data source now has its own freshness timestamp and shows `STALE` 
 
 ## 功能
 
-- **LVGL 监控面板**（横屏 320×170，背光 0–100% 映射，模板日间默认 45%）：WAN 在线状态、在线设备数、网关 PING（橙色描边胶囊）、下行/上行实时速率大数字（主页 D-DIN Italic、焦点页原生 48px，青/蓝胶囊标签）、约 10 秒三色滚动趋势曲线（15 FPS，临界阻尼平滑）
+- **LVGL 监控面板**（横屏 320×170，背光最高限制 50%，模板日间默认 45%）：WAN 在线状态、在线设备数、网关 PING（橙色描边胶囊）、下行/上行实时速率大数字（像素对齐 36px 数字、青/蓝胶囊标签）、约 20 秒三色滚动趋势曲线（15 FPS，临界阻尼平滑）
 - **iKuai 路由器数据源**：HTTPS + Bearer token + 固定证书，1 秒轮询
 - **离线演示模式**：`APP_DEMO_MODE=1` 时使用模拟数据运行
 
 ## 构建 / Build
 
 ```bash
-# 干净检出即可先编译离线演示，不连接 Wi-Fi/iKuai
-pio run -e t-display-s3
-
-# 连接真实 iKuai 时再创建以下本地文件，并填写配置/证书
+# 正式 PlatformIO 环境强制非 Demo；先创建本地真实配置
 cp src/config.example.h src/config.h
 cp src/ikuai_cert.example.h src/ikuai_cert.h
-pio run -e t-display-s3       # 编译
+# 填写 src/config.h 与 src/ikuai_cert.h 后编译
+pio run -e t-display-s3
+
+# 烧录
 pio run -e t-display-s3 -t upload
 pio device monitor
 ```
 
+`platformio.ini` 已将 `APP_DEMO_MODE=0` 和 `APP_REQUIRE_LIVE_MODE=1` 固定用于本环境。没有本地配置时，固件仍是实时模式，但只能显示连接等待/错误状态，不会显示模拟 Demo 数据。
+
 `APP_REDUCED_MOTION=1` 可关闭流星动效，保留原子换页和曲线滚动，适合对动效敏感或需要更安静显示的场景。最新实机验证记录见仓库根目录 [`CHANGELOG.md`](../../CHANGELOG.md)。
+
+趋势曲线使用固定上限归一化，静态遥测不会因自动缩放而自行移动。可在本地 `config.h` 中通过 `APP_CURVE_DOWN_CEILING_BPS`、`APP_CURVE_UP_CEILING_BPS` 和 `APP_CURVE_PING_CEILING_MS` 覆盖默认上限；速率单位始终是 B/s，默认 `125000000` B/s 等于 1 Gbit/s，PING 默认上限为 200 ms。焦点页 `PEAK` 仍取最近 60 个原始下载样本的最大值，不参与曲线缩放。
 
 LVGL 9.2.2 由 `src/idf_component.yml` 管理，版本锁定在 `dependencies.lock`；`components/lv_conf.h` 是本板的精简配置。`src/config.h`、`src/ikuai_cert.h`、构建目录和生成的 `sdkconfig` 均为本地文件，不要提交。
 
 ## Build / English
 
-Run `pio run -e t-display-s3` from a clean checkout to build the offline demo. The demo uses the tracked example configuration and makes no network connection. The CUKTECH-inspired interface contains ten single-purpose pages: overview, download focus, dual traffic lanes, trend, network health, device status, router health, WAN details, top clients, and wireless AC. For live iKuai monitoring, copy both example headers to `src/config.h` and `src/ikuai_cert.h`, fill in Wi‑Fi/router settings and the CA certificate, then set `APP_DEMO_MODE` to `0` before building and uploading. Set `APP_REDUCED_MOTION` to `1` for a calmer display mode; the scheduled night mode also lowers the curve rate to 15 FPS and suppresses decorative motion.
+The PlatformIO environment is fixed to live mode with `APP_DEMO_MODE=0` and `APP_REQUIRE_LIVE_MODE=1`. On a clean checkout, copy both example headers to `src/config.h` and `src/ikuai_cert.h`, fill in the local Wi‑Fi/router settings and CA certificate, then build and upload. Without those local files the firmware remains in live mode but can only show connection-wait/error states; it never uses simulated Demo data. Set `APP_REDUCED_MOTION` to `1` for a calmer display mode; the scheduled night mode keeps the 15 FPS curve and suppresses decorative motion.
+
+Trend normalization uses stable configurable ceilings, so unchanged telemetry cannot move vertically because of autoscaling. Override `APP_CURVE_DOWN_CEILING_BPS`, `APP_CURVE_UP_CEILING_BPS`, and `APP_CURVE_PING_CEILING_MS` in local `config.h`; rate ceilings are always B/s (the default `125000000` B/s is 1 Gbit/s) and the default ping ceiling is 200 ms. The focus-page `PEAK` remains the maximum of the latest 60 raw download samples and is independent of animation scaling.
 
 LVGL 9.2.2 is managed by `src/idf_component.yml` and pinned in `dependencies.lock`. The board-specific trimmed feature set lives in `components/lv_conf.h`. Local credentials, certificates, build output, and generated `sdkconfig` files are intentionally excluded from Git.
 
-The current firmware has been built, flashed to a physical T-Display-S3, and exercised against a live iKuai HTTPS endpoint. The serial run confirmed PSRAM, Wi‑Fi association, and a successful API response; visual acceptance of every page remains a direct-screen check.
+The current optimized image has been flashed to a physical T-Display-S3. USB-JTAG verified all three images, and runtime logs confirmed the 8 MB PSRAM test, the 8 KB HTTP response buffer in PSRAM, live Wi-Fi/iKuai API recovery, and steady `curve_fps=15.0`. Internal RAM settled at 86,879 bytes free with a 31,744-byte largest block. Anonymous parser evidence confirmed three client rows, the current AC-off state, and two WAN status/stream pairs. Physical rendering, startup artifacts, button feedback, clipping on pages 6–10, and rapid page switching still require a direct-screen check.
 
 ## 目录结构
 
@@ -105,5 +111,5 @@ src/
 ├── ikuai_monitor.c/h     # iKuai 路由器监控
 ├── lcd_driver.c/h        # ST7789 i80 并口驱动（esp_lcd）
 ├── lv_port_disp.c/h      # LVGL 显示移植层
-└── fonts/                # D-DIN / D-DIN Italic LVGL 字体
+└── fonts/                # 像素对齐的 LVGL 标签与数字字体
 ```

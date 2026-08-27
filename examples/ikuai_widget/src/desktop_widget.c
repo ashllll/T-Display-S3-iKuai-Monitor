@@ -1,5 +1,5 @@
 // iKuai 实时监视小屏（酷态科小屏设计语言:黑底 + 大数字 + 胶囊标签 + 无网格曲线）
-// 首页只保留 WAN 状态、实时上下行、在线设备、PING 和约 10 秒三色趋势。
+// 首页只保留 WAN 状态、实时上下行、在线设备、PING 和约 20 秒三色趋势。
 // 每个刷新帧固定左移 1px，并用临界阻尼连续跟随新采样，避免低速走格与折线突变。
 #include "desktop_widget.h"
 #include "lcd_driver.h"
@@ -8,6 +8,17 @@
 #else
 #include "config.example.h"
 #endif
+
+#ifndef APP_CURVE_DOWN_CEILING_BPS
+#define APP_CURVE_DOWN_CEILING_BPS 125000000U
+#endif
+#ifndef APP_CURVE_UP_CEILING_BPS
+#define APP_CURVE_UP_CEILING_BPS 125000000U
+#endif
+#ifndef APP_CURVE_PING_CEILING_MS
+#define APP_CURVE_PING_CEILING_MS 200.0f
+#endif
+
 #include "lvgl.h"
 #include "lv_port_disp.h"
 #include "ikuai_monitor.h"
@@ -15,6 +26,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <math.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
 #include "freertos/idf_additions.h"
@@ -73,7 +85,6 @@ static volatile bool s_wifi_ok = false;
 static volatile uint8_t s_wifi_retry_count = 0;
 static esp_timer_handle_t s_wifi_retry_timer;
 static bool s_night_dim = false;
-static lv_timer_t *s_roll_timer;
 static data_trust_t s_data_trust = APP_DEMO_MODE ? DATA_TRUST_DEMO : DATA_TRUST_WARMING;
 static void refresh_source_label(void);
 
@@ -87,8 +98,9 @@ static void refresh_source_label(void);
 #define CLR_GREEN    0x36D27E  // 状态:在线
 #define CLR_DOWN     0x37C4D6  // 数据青 = 下行
 #define CLR_UP       0x3FA9F5  // 品牌蓝 = 上行
-#define CLR_PING     0xFF7A1A  // 能量橙 = PING/警示
-#define CLR_YELLOW   0xFFC800  // 强调黄
+#define CLR_PING     0xFF7A1A  // 能量橙 = 网关延迟
+#define CLR_YELLOW   0xFFC800  // 选择/提醒/数据过期
+#define CLR_SYSTEM   0xC8E63C  // 系统诊断青柠
 #define CLR_RED      0xFF4057  // 状态:离线
 
 #define CURVE_W 298
@@ -99,8 +111,17 @@ static void refresh_source_label(void);
 #define DUAL_CURVE_W 132
 #define DUAL_CURVE_H 28
 #define CURVE_FPS 15
+#define CURVE_WINDOW_SEC ((CURVE2_W + CURVE_FPS / 2) / CURVE_FPS)
+_Static_assert(CURVE_WINDOW_SEC == 20, "full trend window must remain 20 seconds");
 #define CURVE_SMOOTH_SEC 0.28f
+// 软斜率上限(归一化/秒)：0.525 = 原 0.035/帧 * 15 FPS。
+// 使用 tanh 软饱和而不是硬截断，避免速度在阈值处产生接缝。
+#define CURVE_SLOPE_PER_SEC 0.525f
 #define ACTIVE_BPS (48 * 1024)
+#define NET_LOSS_WARN_PCT 1.0f
+#define NET_LOSS_BAD_PCT 5.0f
+#define NET_JITTER_WARN_MS 20.0f
+#define EXT_SAMPLE_MAX_AGE_SEC 20
 
 #define RGB565(r,g,b) (uint16_t)(((r & 0xF8) << 8) | ((g & 0xFC) << 3) | (b >> 3))
 
@@ -179,13 +200,29 @@ static void wifi_start(void) {
 // ═══════════════════ 流动曲线引擎 ═════════════════════════════════════
 
 static lv_obj_t *canvas_curve;
-LV_DRAW_BUF_DEFINE_STATIC(cvs_curve, CURVE_W, CURVE_H, LV_COLOR_FORMAT_RGB565);
+static lv_draw_buf_t cvs_curve;
 static lv_obj_t *canvas_curve2;
-LV_DRAW_BUF_DEFINE_STATIC(cvs_curve2, CURVE2_W, CURVE2_H, LV_COLOR_FORMAT_RGB565);
+static lv_draw_buf_t cvs_curve2;
 static lv_obj_t *canvas_dual_down, *canvas_dual_up;
-LV_DRAW_BUF_DEFINE_STATIC(cvs_dual_down, DUAL_CURVE_W, DUAL_CURVE_H, LV_COLOR_FORMAT_RGB565);
-LV_DRAW_BUF_DEFINE_STATIC(cvs_dual_up, DUAL_CURVE_W, DUAL_CURVE_H, LV_COLOR_FORMAT_RGB565);
+static lv_draw_buf_t cvs_dual_down;
+static lv_draw_buf_t cvs_dual_up;
 static void meteor_step(void);
+
+// Canvas history is CPU-only working data; the i80 DMA uses the two internal
+// display buffers in lv_port_disp.c. Keep these large histories in PSRAM so
+// Wi-Fi/TLS retain enough contiguous internal RAM under load.
+static void canvas_draw_buf_init_psram(lv_draw_buf_t *draw_buf, uint32_t w, uint32_t h) {
+    const uint32_t stride = LV_DRAW_BUF_STRIDE(w, LV_COLOR_FORMAT_RGB565);
+    const size_t size = LV_DRAW_BUF_SIZE(w, h, LV_COLOR_FORMAT_RGB565);
+    void *data = heap_caps_aligned_calloc(LV_DRAW_BUF_ALIGN, 1, size,
+                                          MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (!data) ESP_ERROR_CHECK(ESP_ERR_NO_MEM);
+    if (lv_draw_buf_init(draw_buf, w, h, LV_COLOR_FORMAT_RGB565,
+                         stride, data, size) != LV_RESULT_OK) {
+        ESP_ERROR_CHECK(ESP_FAIL);
+    }
+    lv_draw_buf_set_flag(draw_buf, LV_IMAGE_FLAGS_MODIFIABLE);
+}
 
 typedef struct {
     float cur;
@@ -198,15 +235,17 @@ typedef struct {
 
 enum { TRACK_DOWN, TRACK_UP, TRACK_PING, TRACK_COUNT };
 static curve_track_t s_track[TRACK_COUNT];
-static uint32_t s_peak_down = 1024;
-static uint32_t s_peak_up = 1024;
-static float s_peak_ping = 50.0f;
+static uint32_t s_focus_peak_down;
 static uint16_t s_c_bg;
 static uint16_t s_c_grid;
-static int s_last_y[TRACK_COUNT] = { CURVE_H - 3, CURVE_H - 3, CURVE_H - 3 };
-static int s_last_y2[TRACK_COUNT] = { CURVE2_H - 3, CURVE2_H - 3, CURVE2_H - 3 };
-static int s_last_dual_y[2] = { DUAL_CURVE_H - 3, DUAL_CURVE_H - 3 };
+static float s_last_yf[TRACK_COUNT] = { CURVE_H - 3.0f, CURVE_H - 3.0f, CURVE_H - 3.0f };
+static float s_last_y2f[TRACK_COUNT] = { CURVE2_H - 3.0f, CURVE2_H - 3.0f, CURVE2_H - 3.0f };
+static float s_last_dualf[2] = { DUAL_CURVE_H - 3.0f, DUAL_CURVE_H - 3.0f };
 static uint32_t s_curve_frames;
+
+static size_t internal_heap_free(void) {
+    return heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+}
 
 static uint16_t mix565(uint16_t bg, uint16_t fg, uint8_t a) {
     if (a == 0) return bg;
@@ -224,12 +263,61 @@ static void curve_clear(void) {
     }
 }
 
-static int curve_y_h(float value, int h) {
-    if (value < 0) value = 0;
-    if (value > 1) value = 1;
-    return (int)((1.0f - value) * (h - 5) + 2.5f);
+static float curve_yf_h(float value, int h) {
+    if (value < 0.0f) value = 0.0f;
+    if (value > 1.0f) value = 1.0f;
+    return (1.0f - value) * (float)(h - 5) + 2.5f;
 }
-static int curve_y(float value) { return curve_y_h(value, CURVE_H); }
+
+static float normalize_rate(uint32_t bps, uint32_t ceiling_bps) {
+    if (bps == 0 || ceiling_bps == 0) return 0.0f;
+    float value = log1pf((float)bps / 1024.0f) /
+                  log1pf((float)ceiling_bps / 1024.0f);
+    return value > 1.0f ? 1.0f : value;
+}
+
+static uint32_t raw_peak_u32(const uint32_t *values, int count) {
+    uint32_t peak = 0;
+    for (int i = 0; i < count; i++) {
+        if (values[i] > peak) peak = values[i];
+    }
+    return peak;
+}
+
+// 抗锯齿像素混合：把 color 以 a(0..255) 透明度覆盖到已有像素上。
+static inline void px_aa(uint16_t *buf, int w, int h, int x, int y,
+                         uint16_t color, uint8_t a) {
+    if (a == 0 || x < 0 || x >= w || y < 0 || y >= h) return;
+    uint16_t *p = buf + (size_t)y * w + x;
+    *p = mix565(*p, color, a);
+}
+
+// 2px 亮线核 + 上下软边：yf 为亚像素纵向位置，随值平滑滑动，消除整数阶梯。
+static void core_aa(uint16_t *buf, int w, int h, int x, float yf, uint16_t color) {
+    int yi = (int)yf;
+    float f = yf - (float)yi;
+    if (f < 0.0f) { f += 1.0f; yi--; }
+    px_aa(buf, w, h, x, yi,     color, (uint8_t)((1.0f - f) * 255.0f));
+    px_aa(buf, w, h, x, yi + 1, color, 255);
+    px_aa(buf, w, h, x, yi + 2, color, (uint8_t)(f * 255.0f));
+}
+
+// 相邻采样点之间的纵向连接(暗色)，两端软边，消除硬 90° 拐角。
+static void connect_aa(uint16_t *buf, int w, int h, int x, float y0f, float y1f,
+                       uint16_t dim) {
+    if (x < 0 || x >= w) return;
+    float lo = y0f < y1f ? y0f : y1f;
+    float hi = y0f > y1f ? y0f : y1f;
+    if (hi - lo < 0.001f) return;   // 无位移时不画连接线
+    int iy0 = (int)lo;
+    int iy1 = (int)hi;
+    float fb = lo - (float)iy0;
+    if (fb < 0.0f) { fb += 1.0f; iy0--; }
+    px_aa(buf, w, h, x, iy0, dim, (uint8_t)((1.0f - fb) * 255.0f));
+    for (int y = iy0 + 1; y <= iy1; y++) px_aa(buf, w, h, x, y, dim, 255);
+    float ft = hi - (float)iy1;
+    px_aa(buf, w, h, x, iy1 + 1, dim, (uint8_t)(ft * 255.0f));
+}
 
 static void curve_clear_column(uint16_t *buf, int x) {
     for (int y = 0; y < CURVE_H; y++) {
@@ -238,21 +326,17 @@ static void curve_clear_column(uint16_t *buf, int x) {
 }
 
 static void curve_draw_track(uint16_t *buf, int x, int index, const curve_track_t *track) {
-    int y = curve_y(track->cur);
-    int y0 = s_last_y[index];
-    int lo = y < y0 ? y : y0;
-    int hi = y > y0 ? y : y0;
-    for (int yy = lo; yy <= hi; yy++) buf[yy * CURVE_W + x] = track->dim;
-    buf[y * CURVE_W + x] = track->color;
-    if (y + 1 < CURVE_H) buf[(y + 1) * CURVE_W + x] = track->color;
-    if (x > 0) buf[y * CURVE_W + x - 1] = track->dim;
-    s_last_y[index] = y;
+    float yf = curve_yf_h(track->cur, CURVE_H);
+    float y0f = s_last_yf[index];
+    connect_aa(buf, CURVE_W, CURVE_H, x, y0f, yf, track->dim);
+    core_aa(buf, CURVE_W, CURVE_H, x, yf, track->color);
+    s_last_yf[index] = yf;
 }
 
 // 30号站同款 sparkline:亮线 + 向下渐变填充(仅下行主轨道)
 static void curve_draw_track_fill(uint16_t *buf, int x, int index, const curve_track_t *track) {
     curve_draw_track(buf, x, index, track);
-    int y = curve_y(track->cur);
+    int y = (int)curve_yf_h(track->cur, CURVE_H);
     for (int yy = y + 2; yy < CURVE_H; yy++) {
         int depth = yy - y;                        // 越深越淡
         uint16_t px = buf[yy * CURVE_W + x];
@@ -261,24 +345,27 @@ static void curve_draw_track_fill(uint16_t *buf, int x, int index, const curve_t
     }
 }
 
-// 临界阻尼平滑：位置和速度都连续，目标每秒跳变时也不会出现折线硬拐角。
-static void curve_smooth_step(curve_track_t *track) {
-    const float dt = 1.0f / CURVE_FPS;
+// 真实时间闭式临界阻尼：位置和速度连续，延迟帧也按相同时间常数推进。
+static void curve_smooth_step(curve_track_t *track, float dt) {
     const float omega = 2.0f / CURVE_SMOOTH_SEC;
-    const float x = omega * dt;
-    const float decay = 1.0f / (1.0f + x + 0.48f * x * x + 0.235f * x * x * x);
-    const float current = track->cur;
-    const float change = current - track->target;
-    const float temp = (track->velocity + omega * change) * dt;
+    const float displacement = track->cur - track->target;
+    const float helper = track->velocity + omega * displacement;
+    const float decay = expf(-omega * dt);
+    const float next_displacement = (displacement + helper * dt) * decay;
+    const float next_velocity = (track->velocity - omega * helper * dt) * decay;
+    const float proposed = track->target + next_displacement;
 
-    track->velocity = (track->velocity - omega * temp) * decay;
-    track->cur = track->target + (change + temp) * decay;
-
-    // 目标反向变化时禁止越过目标，避免视觉上的虚假过冲。
-    if (((track->target - current) > 0.0f) == (track->cur > track->target)) {
-        track->cur = track->target;
-        track->velocity = 0.0f;
+    const float max_delta = CURVE_SLOPE_PER_SEC * dt;
+    const float delta = proposed - track->cur;
+    if (max_delta > 0.0f && fabsf(delta) > max_delta) {
+        const float limited = max_delta * tanhf(delta / max_delta);
+        track->cur += limited;
+        track->velocity = limited / dt;
+    } else {
+        track->cur = proposed;
+        track->velocity = next_velocity;
     }
+
     if (track->cur < 0.0f) {
         track->cur = 0.0f;
         track->velocity = 0.0f;
@@ -297,26 +384,19 @@ static void dual_curve_roll(lv_draw_buf_t *draw_buf, lv_obj_t *canvas,
         row[DUAL_CURVE_W - 1] = s_c_bg;
     }
 
-    int y = curve_y_h(track->cur, DUAL_CURVE_H);
-    int y0 = s_last_dual_y[lane];
-    int lo = y < y0 ? y : y0;
-    int hi = y > y0 ? y : y0;
-    for (int yy = lo; yy <= hi; yy++) {
-        buf[yy * DUAL_CURVE_W + DUAL_CURVE_W - 1] = track->dim;
-    }
-    buf[y * DUAL_CURVE_W + DUAL_CURVE_W - 1] = track->color;
-    if (y + 1 < DUAL_CURVE_H) {
-        buf[(y + 1) * DUAL_CURVE_W + DUAL_CURVE_W - 1] = track->color;
-    }
-    s_last_dual_y[lane] = y;
+    float yf = curve_yf_h(track->cur, DUAL_CURVE_H);
+    float y0f = s_last_dualf[lane];
+    connect_aa(buf, DUAL_CURVE_W, DUAL_CURVE_H, DUAL_CURVE_W - 1, y0f, yf, track->dim);
+    core_aa(buf, DUAL_CURVE_W, DUAL_CURVE_H, DUAL_CURVE_W - 1, yf, track->color);
+    s_last_dualf[lane] = yf;
     if (canvas && lv_obj_is_visible(canvas)) lv_obj_invalidate(canvas);
 }
 
-// 15fps 固定推进 1px：298px 宽对应约 19.9 秒，降低小屏刷新负载并保持连续趋势。
-static void curve_roll(void) {
+// 15fps 固定推进 1px：298px 宽对应约 19.9 秒，弹簧按真实 dt 推进。
+static void curve_roll(float dt) {
     uint16_t *buf = (uint16_t *)cvs_curve.data;
     for (int i = 0; i < TRACK_COUNT; i++) {
-        curve_smooth_step(&s_track[i]);
+        curve_smooth_step(&s_track[i], dt);
     }
 
     // Only mutate and invalidate the curve that is currently on screen.
@@ -345,13 +425,11 @@ static void curve_roll(void) {
         }
         for (int y = 0; y < CURVE2_H; y++) buf2[y * CURVE2_W + CURVE2_W - 1] = s_c_bg;
         for (int i = 0; i < TRACK_COUNT; i++) {
-            int y = curve_y_h(s_track[i].cur, CURVE2_H);
-            int y0 = s_last_y2[i];
-            int lo = y < y0 ? y : y0, hi = y > y0 ? y : y0;
-            for (int yy = lo; yy <= hi; yy++) buf2[yy * CURVE2_W + CURVE2_W - 1] = s_track[i].dim;
-            buf2[y * CURVE2_W + CURVE2_W - 1] = s_track[i].color;
-            if (y + 1 < CURVE2_H) buf2[(y + 1) * CURVE2_W + CURVE2_W - 1] = s_track[i].color;
-            s_last_y2[i] = y;
+            float yf = curve_yf_h(s_track[i].cur, CURVE2_H);
+            float y0f = s_last_y2f[i];
+            connect_aa(buf2, CURVE2_W, CURVE2_H, CURVE2_W - 1, y0f, yf, s_track[i].dim);
+            core_aa(buf2, CURVE2_W, CURVE2_H, CURVE2_W - 1, yf, s_track[i].color);
+            s_last_y2f[i] = yf;
         }
         lv_obj_invalidate(canvas_curve2);
     }
@@ -384,7 +462,10 @@ typedef enum {
 static rate_unit_t s_down_unit = RATE_UNIT_AUTO;
 static rate_unit_t s_up_unit = RATE_UNIT_AUTO;
 static rate_unit_t s_peak_unit = RATE_UNIT_AUTO;
-static rate_unit_t s_client_unit[3] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO, RATE_UNIT_AUTO };
+static rate_unit_t s_client_down_unit[3] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO, RATE_UNIT_AUTO };
+static rate_unit_t s_client_up_unit[3] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO, RATE_UNIT_AUTO };
+static rate_unit_t s_wan_down_unit[2] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO };
+static rate_unit_t s_wan_up_unit[2] = { RATE_UNIT_AUTO, RATE_UNIT_AUTO };
 
 static rate_unit_t rate_unit_initial(uint32_t bytes_per_sec) {
     if (bytes_per_sec >= 1024U * 1024U * 1024U) return RATE_UNIT_GB;
@@ -427,6 +508,26 @@ static void fmt_rate(uint32_t bytes_per_sec, rate_unit_t *state,
         float scaled = bytes_per_sec / divisor;
         snprintf(value, value_cap, scaled >= 100.0f ? "%.0f" : "%.1f", scaled);
     }
+}
+
+static void fmt_rate_compact(char prefix, uint32_t bytes_per_sec,
+                             rate_unit_t *state, char *out, size_t cap) {
+    char value[12];
+    const char *unit;
+    fmt_rate(bytes_per_sec, state, value, sizeof(value), &unit);
+    snprintf(out, cap, "%c%s%c", prefix, value, unit[0]);
+}
+
+static void fmt_bytes(uint64_t bytes, char *out, size_t cap) {
+    static const char *units[] = { "B", "KB", "MB", "GB", "TB" };
+    double value = (double)bytes;
+    int unit = 0;
+    while (value >= 1024.0 && unit < 4) {
+        value /= 1024.0;
+        unit++;
+    }
+    if (unit == 0) snprintf(out, cap, "%lluB", (unsigned long long)bytes);
+    else snprintf(out, cap, value >= 100.0 ? "%.0f%s" : "%.1f%s", value, units[unit]);
 }
 
 static lv_obj_t *mk_label(lv_obj_t *parent, int x, int y, const lv_font_t *f, uint32_t color) {
@@ -493,7 +594,7 @@ static lv_obj_t *mk_block(lv_obj_t *parent, int x, int y, int w, int h, uint32_t
 #define METEOR_H 40        // 覆盖大数字垂直中心区(数字视觉中心 y≈66)
 #define METEOR_N 6         // 短暂反馈，不持续铺满焦点页
 static lv_obj_t *canvas_meteor;
-LV_DRAW_BUF_DEFINE_STATIC(cvs_meteor, METEOR_W, METEOR_H, LV_COLOR_FORMAT_RGB565);
+static lv_draw_buf_t cvs_meteor;
 static struct { float x, y, vx, vy; } s_mt[METEOR_N];
 static bool s_meteor_on = false;
 static bool s_last_active;   // 先行声明,定义在下方 ui_update 区
@@ -567,6 +668,7 @@ static void meteor_note_rate(uint32_t bps) {
 #define PIN_BUTTON_PREV GPIO_NUM_0
 #define PIN_BUTTON_NEXT GPIO_NUM_14
 #define BUTTON_DEBOUNCE_MS 30
+#define BUTTON_FEEDBACK_MS 120
 
 static lv_obj_t *s_pg[PAGE_COUNT];
 static lv_obj_t *s_dots[PAGE_COUNT];
@@ -591,16 +693,17 @@ static lv_obj_t *lbl_dual_ping, *lbl_dual_ip, *lbl_dual_state;
 // 网络健康页元素
 static lv_obj_t *lbl_net_status, *lbl_net_detail, *lbl_net_ping;
 static lv_obj_t *lbl_net_down, *lbl_net_up, *lbl_net_footer;
-// 系统页元素
-static lv_obj_t *lbl_sys_ip, *lbl_sys_clients, *lbl_sys_uptime, *lbl_sys_heap;
+// 路由负载页元素
+static lv_obj_t *lbl_load_state, *lbl_load_conn;
+static lv_obj_t *lbl_load_tcp, *lbl_load_udp, *lbl_load_icmp, *lbl_load_footer;
 // 健康页/WAN页/排行页/AC页元素
 static lv_obj_t *lbl_health_status, *lbl_cpu, *lbl_mem, *lbl_temp, *lbl_uptime, *lbl_health_meta;
 static lv_obj_t *lbl_cpu_unit, *lbl_mem_unit;
-static lv_obj_t *lbl_wan[2][3];   // [i][0=状态 1=IP 2=网关]
+static lv_obj_t *lbl_wan[2][4];   // [i][0=状态 1=下行 2=上行 3=连接/丢包/IP]
 static lv_obj_t *lbl_wan_dot[2];
-static lv_obj_t *lbl_cli[3][2];   // [i][0=名称 1=速率]
+static lv_obj_t *lbl_cli[3][3];   // [i][0=名称 1=下行 2=上行]
 static lv_obj_t *lbl_top_count, *lbl_top_total;
-static lv_obj_t *lbl_ac, *lbl_ap, *lbl_clt_2g, *lbl_clt_5g;
+static lv_obj_t *lbl_ac, *lbl_ap, *lbl_clt_2g, *lbl_clt_5g, *lbl_ac_meta;
 
 static void show_page(int idx, int dir) {
     if (idx < 0 || idx >= PAGE_COUNT || idx == s_page) return;
@@ -628,8 +731,16 @@ static void show_page(int idx, int dir) {
 static void button_feedback(void) {
     if (s_page >= 0 && s_page < PAGE_COUNT) {
         lv_obj_set_style_bg_color(s_dots[s_page], lv_color_hex(CLR_TEXT), 0);
-        s_dot_feedback_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + 220;
+        s_dot_feedback_until_ms = (uint32_t)(esp_timer_get_time() / 1000) + BUTTON_FEEDBACK_MS;
     }
+}
+
+static void button_feedback_poll(uint32_t now_ms) {
+    if (!s_dot_feedback_until_ms ||
+        (int32_t)(now_ms - s_dot_feedback_until_ms) < 0) return;
+    s_dot_feedback_until_ms = 0;
+    if (s_page >= 0 && s_page < PAGE_COUNT)
+        lv_obj_set_style_bg_color(s_dots[s_page], lv_color_hex(CLR_YELLOW), 0);
 }
 
 static lv_obj_t *mk_page(lv_obj_t *scr) {
@@ -699,6 +810,12 @@ static void build_page_dual(lv_obj_t *pg) {
     lv_label_set_text(lbl_dual_ip, "IP ---");
 }
 
+static const char *curve_window_state_text(bool demo) {
+    static char text[16];
+    snprintf(text, sizeof(text), "%dS %s", CURVE_WINDOW_SEC, demo ? "DEMO" : "LIVE");
+    return text;
+}
+
 // 页面 3:趋势优先 —— 无坐标轴无网格，数值负责解释曲线。
 static void build_page_curve(lv_obj_t *pg) {
     // Three fixed columns leave a visible gap between live values. The short
@@ -721,7 +838,7 @@ static void build_page_curve(lv_obj_t *pg) {
     lv_canvas_set_draw_buf(canvas_curve2, &cvs_curve2);
 
     lbl_curve_state = mk_label(pg, 12, 140, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(lbl_curve_state, "10S LIVE");
+    lv_label_set_text(lbl_curve_state, curve_window_state_text(APP_DEMO_MODE));
     lv_obj_t *legend = mk_label(pg, 0, 140, UI_FONT_META, CLR_DIM);
     lv_obj_align(legend, LV_ALIGN_TOP_RIGHT, -12, 140);
     lv_label_set_text(legend, "D / U / P");
@@ -753,22 +870,35 @@ static void build_page_network(lv_obj_t *pg) {
     lv_label_set_text(lbl_net_footer, "NO ACTIVE ALERTS");
 }
 
-// 页面 5:设备状态页 —— 本机 IP、客户端、运行时间和堆内存。
-static void sys_row(lv_obj_t *pg, int y, const char *name, uint32_t pill_clr, lv_obj_t **val) {
-    mk_pill(pg, 12, y, name, pill_clr, 0x000000);
-    *val = mk_label(pg, 0, y + 2, UI_FONT_META, CLR_TEXT);
-    lv_obj_align(*val, LV_ALIGN_TOP_RIGHT, -12, y + 2);
-    lv_label_set_text(*val, "--");
-}
+// 页面 5:路由负载 —— 连接总量是主值，协议拆解与链路质量退居二层。
+static void build_page_load(lv_obj_t *pg) {
+    lv_obj_t *title = mk_label(pg, 12, 2, UI_FONT_TITLE, CLR_DIM);
+    lv_label_set_text(title, "ROUTER LOAD");
+    lbl_load_state = mk_label(pg, 0, 5, UI_FONT_META, CLR_DIM);
+    lv_obj_align(lbl_load_state, LV_ALIGN_TOP_RIGHT, -12, 5);
+    lv_label_set_text(lbl_load_state, "WARMING");
+    mk_block(pg, 12, 22, 296, 1, CLR_BORDER);
 
-static void build_page_sys(lv_obj_t *pg) {
-    sys_row(pg, 8,  "IP",      CLR_UP,     &lbl_sys_ip);
-    sys_row(pg, 34, "CLIENTS", CLR_DOWN,   &lbl_sys_clients);
-    sys_row(pg, 60, "DEVICE UP", CLR_YELLOW, &lbl_sys_uptime);
-    sys_row(pg, 86, "HEAP",    CLR_PING,   &lbl_sys_heap);
-    mk_block(pg, 12, 112, 296, 1, CLR_BORDER);
-    lv_obj_t *hint = mk_label(pg, 12, 130, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(hint, "BOOT PREV / IO14 NEXT");
+    mk_pill(pg, 12, 31, "CONNECTIONS", CLR_SYSTEM, 0x000000);
+    lbl_load_conn = mk_label(pg, 12, 47, UI_FONT_METRIC, CLR_TEXT);
+    lv_obj_set_width(lbl_load_conn, 296);
+    lv_obj_set_style_text_align(lbl_load_conn, LV_TEXT_ALIGN_CENTER, 0);
+    lv_label_set_text(lbl_load_conn, "--");
+    mk_block(pg, 12, 91, 296, 1, CLR_BORDER);
+
+    mk_pill(pg, 12, 101, "TCP", CLR_SYSTEM, 0x000000);
+    lbl_load_tcp = mk_label(pg, 55, 103, UI_FONT_META, CLR_TEXT);
+    lv_label_set_text(lbl_load_tcp, "--");
+    mk_pill(pg, 112, 101, "UDP", CLR_UP, 0x000000);
+    lbl_load_udp = mk_label(pg, 155, 103, UI_FONT_META, CLR_TEXT);
+    lv_label_set_text(lbl_load_udp, "--");
+    mk_pill(pg, 214, 101, "ICMP", CLR_PING, 0x000000);
+    lbl_load_icmp = mk_label(pg, 0, 103, UI_FONT_META, CLR_TEXT);
+    lv_obj_align(lbl_load_icmp, LV_ALIGN_TOP_RIGHT, -12, 103);
+    lv_label_set_text(lbl_load_icmp, "--");
+
+    lbl_load_footer = mk_label(pg, 12, 132, UI_FONT_META, CLR_DIM);
+    lv_label_set_text(lbl_load_footer, "-- CLIENTS | LOSS -- | JIT --");
 }
 
 
@@ -781,13 +911,13 @@ static void build_page_health(lv_obj_t *pg) {
     lv_label_set_text(lbl_health_status, "ONLINE");
     mk_block(pg, 12, 22, 296, 1, CLR_BORDER);
 
-    mk_pill(pg, 12, 31, "CPU", CLR_PING, 0x000000);
+    mk_pill(pg, 12, 31, "CPU", CLR_SYSTEM, 0x000000);
     mk_pill(pg, 172, 31, "MEM", CLR_UP, 0x000000);
     lbl_cpu = mk_label(pg, 12, 47, UI_FONT_METRIC, CLR_TEXT);
     lv_label_set_text(lbl_cpu, "--");
     lbl_mem = mk_label(pg, 172, 47, UI_FONT_METRIC, CLR_TEXT);
     lv_label_set_text(lbl_mem, "--");
-    lbl_cpu_unit = mk_label(pg, 12, 71, UI_FONT_META, CLR_PING);
+    lbl_cpu_unit = mk_label(pg, 12, 71, UI_FONT_META, CLR_SYSTEM);
     lv_label_set_text(lbl_cpu_unit, "%");
     align_value_suffix(lbl_cpu, lbl_cpu_unit);
     lbl_mem_unit = mk_label(pg, 172, 71, UI_FONT_META, CLR_UP);
@@ -797,14 +927,14 @@ static void build_page_health(lv_obj_t *pg) {
     mk_pill(pg, 12, 100, "TEMP", CLR_YELLOW, 0x000000);
     lbl_temp = mk_label(pg, 92, 102, UI_FONT_META, CLR_TEXT);
     lv_label_set_text(lbl_temp, "--");
-    mk_pill(pg, 172, 100, "UPTIME", CLR_DOWN, 0x000000);
+    mk_pill(pg, 172, 100, "UPTIME", CLR_SYSTEM, 0x000000);
     lbl_uptime = mk_label(pg, 244, 102, UI_FONT_META, CLR_TEXT);
     lv_label_set_text(lbl_uptime, "--");
     lbl_health_meta = mk_label(pg, 12, 130, UI_FONT_META, CLR_DIM);
     lv_label_set_text(lbl_health_meta, "CLIENTS -- | HEAP -- | VER --");
 }
 
-// 页面 7:WAN 线路详情页 —— 状态点 + 状态词 + 公网 IP + 网关。
+// 页面 7:WAN 线路详情页 —— 每条线路的状态、实时 D/U、连接与丢包。
 static void build_page_wan(lv_obj_t *pg) {
     for (int i = 0; i < 2; i++) {
         int y = 12 + i * 74;
@@ -820,14 +950,16 @@ static void build_page_wan(lv_obj_t *pg) {
         lbl_wan[i][0] = mk_label(pg, 0, y + 2, UI_FONT_META, CLR_GREEN);
         lv_obj_align(lbl_wan[i][0], LV_ALIGN_TOP_RIGHT, -24, y + 2);
         lv_label_set_text(lbl_wan[i][0], "OFFLINE");
-        mk_pill(pg, 12, y + 22, "IP", CLR_DOWN, 0x000000);
-        lbl_wan[i][1] = mk_label(pg, 0, y + 24, UI_FONT_META, CLR_TEXT);
-        lv_obj_align(lbl_wan[i][1], LV_ALIGN_TOP_RIGHT, -12, y + 24);
-        lv_label_set_text(lbl_wan[i][1], "--");
-        mk_pill(pg, 12, y + 44, "GW", CLR_DIM, 0x000000);
-        lbl_wan[i][2] = mk_label(pg, 0, y + 46, UI_FONT_META, CLR_DIM);
-        lv_obj_align(lbl_wan[i][2], LV_ALIGN_TOP_RIGHT, -12, y + 46);
-        lv_label_set_text(lbl_wan[i][2], "--");
+        lbl_wan[i][1] = mk_label(pg, 12, y + 23, UI_FONT_META, CLR_DOWN);
+        constrain_metric_label(lbl_wan[i][1], 132);
+        lv_label_set_text(lbl_wan[i][1], "D--");
+        lbl_wan[i][2] = mk_label(pg, 176, y + 23, UI_FONT_META, CLR_UP);
+        constrain_metric_label(lbl_wan[i][2], 132);
+        lv_obj_set_style_text_align(lbl_wan[i][2], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(lbl_wan[i][2], "U--");
+        lbl_wan[i][3] = mk_label(pg, 12, y + 45, UI_FONT_META, CLR_DIM);
+        constrain_metric_label(lbl_wan[i][3], 296);
+        lv_label_set_text(lbl_wan[i][3], "C -- | DROP -- | IP --");
         if (i == 0) mk_block(pg, 12, y + 64, 296, 1, CLR_BORDER);
     }
 }
@@ -835,7 +967,7 @@ static void build_page_wan(lv_obj_t *pg) {
 // 页面 8:终端流量排行页 —— Top3 下行 + 客户端和总流量摘要。
 static void build_page_top(lv_obj_t *pg) {
     lv_obj_t *t = mk_label(pg, 12, 5, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(t, "TOP DOWNLOADERS");
+    lv_label_set_text(t, "TOP CLIENTS  D / U");
     lbl_top_count = mk_label(pg, 0, 5, UI_FONT_META, CLR_DIM);
     lv_obj_align(lbl_top_count, LV_ALIGN_TOP_RIGHT, -12, 5);
     lv_label_set_text(lbl_top_count, "-- CLIENTS");
@@ -845,12 +977,16 @@ static void build_page_top(lv_obj_t *pg) {
         snprintf(rk, sizeof(rk), "#%d", i + 1);
         mk_pill(pg, 12, y, rk, i == 0 ? CLR_YELLOW : 0x3A4150, i == 0 ? 0x000000 : CLR_TEXT);
         lbl_cli[i][0] = mk_label(pg, 58, y + 2, UI_FONT_META, CLR_TEXT);
-        lv_obj_set_width(lbl_cli[i][0], 150);
+        lv_obj_set_width(lbl_cli[i][0], 108);
         lv_label_set_long_mode(lbl_cli[i][0], LV_LABEL_LONG_CLIP);
         lv_label_set_text(lbl_cli[i][0], "--");
-        lbl_cli[i][1] = mk_label(pg, 0, y + 2, UI_FONT_META, CLR_DOWN);
-        lv_obj_align(lbl_cli[i][1], LV_ALIGN_TOP_RIGHT, -12, y + 2);
-        lv_label_set_text(lbl_cli[i][1], "--");
+        lbl_cli[i][1] = mk_label(pg, 170, y + 2, UI_FONT_META, CLR_DOWN);
+        constrain_metric_label(lbl_cli[i][1], 64);
+        lv_label_set_text(lbl_cli[i][1], "D--");
+        lbl_cli[i][2] = mk_label(pg, 240, y + 2, UI_FONT_META, CLR_UP);
+        constrain_metric_label(lbl_cli[i][2], 68);
+        lv_obj_set_style_text_align(lbl_cli[i][2], LV_TEXT_ALIGN_RIGHT, 0);
+        lv_label_set_text(lbl_cli[i][2], "U--");
         if (i < 2) mk_block(pg, 12, y + 30, 296, 1, CLR_BORDER);
     }
     mk_block(pg, 12, 143, 296, 1, CLR_BORDER);
@@ -870,14 +1006,14 @@ static void build_page_ac(lv_obj_t *pg) {
     lv_obj_align(lbl_ap, LV_ALIGN_TOP_RIGHT, -12, 44);
     lv_label_set_text(lbl_ap, "--");
     mk_pill(pg, 12, 72, "2.4G", CLR_YELLOW, 0x000000);
-    mk_pill(pg, 188, 72, "5G", CLR_PING, 0x000000);
+    mk_pill(pg, 188, 72, "5G", CLR_UP, 0x000000);
     lbl_clt_2g = mk_label(pg, 12, 90, UI_FONT_METRIC, CLR_TEXT);
     lbl_clt_5g = mk_label(pg, 188, 90, UI_FONT_METRIC, CLR_TEXT);
     lv_label_set_text(lbl_clt_2g, "--");
     lv_label_set_text(lbl_clt_5g, "--");
     mk_block(pg, 12, 140, 296, 1, CLR_BORDER);
-    lv_obj_t *radio_hint = mk_label(pg, 12, 148, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(radio_hint, "CLIENTS BY RADIO");
+    lbl_ac_meta = mk_label(pg, 12, 148, UI_FONT_META, CLR_DIM);
+    lv_label_set_text(lbl_ac_meta, "ACTIVE -- | IDLE -- | PEAK --");
 }
 
 
@@ -894,9 +1030,6 @@ static void night_dim_poll(void) {
     if (night != s_night_dim) {
         s_night_dim = night;
         lcd_set_backlight(night ? APP_BL_NIGHT_PCT : APP_BL_PCT);
-        if (s_roll_timer) {
-            lv_timer_set_period(s_roll_timer, night ? (1000 / 15) : (1000 / CURVE_FPS));
-        }
         refresh_source_label();
     }
 }
@@ -917,6 +1050,7 @@ static bool button_pressed(page_button_t *button, uint32_t now) {
 // 两个物理按键各自只负责一个方向，按下稳定 30ms 后立即翻页。
 static void buttons_poll(void) {
     uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    button_feedback_poll(now);
     bool prev = button_pressed(&s_btn_prev, now);
     bool next = button_pressed(&s_btn_next, now);
     if (prev == next) return;  // 无按键或同时按下时不改变页面。
@@ -991,7 +1125,8 @@ static void ui_create(void) {
     lv_obj_set_size(graph, 296, 74);
 
     lbl_main_curve_state = mk_label(graph, 0, 1, UI_FONT_META, CLR_DIM);
-    lv_label_set_text(lbl_main_curve_state, APP_DEMO_MODE ? "10S DEMO" : "WARMING UP");
+    lv_label_set_text(lbl_main_curve_state,
+                      APP_DEMO_MODE ? curve_window_state_text(true) : "WARMING UP");
     // 图例:3px 色块 + 小字(色块即编码,不占胶囊)
     mk_block(graph, 78, 6, 3, 3, CLR_DOWN);
     lv_obj_t *legend_down = mk_label(graph, 85, 1, UI_FONT_META, CLR_DOWN);
@@ -1017,7 +1152,7 @@ static void ui_create(void) {
     build_page_dual(s_pg[2]);
     build_page_curve(s_pg[3]);
     build_page_network(s_pg[4]);
-    build_page_sys(s_pg[5]);
+    build_page_load(s_pg[5]);
     build_page_health(s_pg[6]);
     build_page_wan(s_pg[7]);
     build_page_top(s_pg[8]);
@@ -1086,7 +1221,7 @@ static void set_curve_state(const char *text, uint32_t color) {
 static uint32_t trust_color(data_trust_t trust) {
     switch (trust) {
         case DATA_TRUST_LIVE: return CLR_GREEN;
-        case DATA_TRUST_STALE: return CLR_PING;
+        case DATA_TRUST_STALE: return CLR_YELLOW;
         case DATA_TRUST_TIMEOUT:
         case DATA_TRUST_OFFLINE: return CLR_RED;
         default: return CLR_DIM;
@@ -1119,13 +1254,13 @@ static void set_curve_trust(data_trust_t trust, bool window_ready) {
     s_data_trust = trust;
     switch (trust) {
         case DATA_TRUST_LIVE:
-            set_curve_state(window_ready ? "10S LIVE" : "WARMING UP",
+            set_curve_state(window_ready ? curve_window_state_text(false) : "WARMING UP",
                             window_ready ? CLR_GREEN : CLR_DIM);
             break;
-        case DATA_TRUST_STALE: set_curve_state("STALE", CLR_PING); break;
+        case DATA_TRUST_STALE: set_curve_state("STALE", CLR_YELLOW); break;
         case DATA_TRUST_TIMEOUT: set_curve_state("TIMEOUT", CLR_RED); break;
         case DATA_TRUST_OFFLINE: set_curve_state("OFFLINE", CLR_RED); break;
-        case DATA_TRUST_DEMO: set_curve_state("10S DEMO", CLR_DIM); break;
+        case DATA_TRUST_DEMO: set_curve_state(curve_window_state_text(true), CLR_DIM); break;
         case DATA_TRUST_NO_DATA: set_curve_state("NO DATA", CLR_DIM); break;
         default: set_curve_state("WARMING UP", CLR_DIM); break;
     }
@@ -1167,12 +1302,140 @@ static bool s_last_sys_ok = false;
 static char s_last_d[16] = "--", s_last_u[16] = "--";
 static const char *s_last_du = "MB/s", *s_last_uu = "MB/s";
 static long s_last_clients = -1;
+static bool s_last_conn_valid, s_last_tcp_conn_valid;
+static bool s_last_udp_conn_valid, s_last_icmp_conn_valid;
+static uint32_t s_last_conn, s_last_tcp_conn, s_last_udp_conn, s_last_icmp_conn;
+static bool s_last_totals_valid;
+static uint64_t s_last_total_down, s_last_total_up;
+
+typedef struct {
+    bool ready;
+    float loss_pct;
+    float avg_ms;
+    float jitter_ms;
+} network_quality_t;
+
+static network_quality_t s_quality;
+
+static void fmt_count(uint32_t value, char *out, size_t cap) {
+    if (value >= 1000000U)
+        snprintf(out, cap, "%.1fM", (double)value / 1000000.0);
+    else if (value >= 10000U)
+        snprintf(out, cap, "%.1fK", (double)value / 1000.0);
+    else
+        snprintf(out, cap, "%lu", (unsigned long)value);
+}
+
+static void update_network_quality(const ikuai_curve_t *curve) {
+    network_quality_t q = { 0 };
+    if (!curve || curve->n <= 0) {
+        s_quality = q;
+        return;
+    }
+    int lost = 0, valid = 0, pairs = 0;
+    float sum = 0.0f, jitter_sum = 0.0f, previous = 0.0f;
+    bool have_previous = false;
+    int start = (curve->head - curve->n + IKUAI_CURVE_MAX) % IKUAI_CURVE_MAX;
+    for (int i = 0; i < curve->n; i++) {
+        float ping = curve->ping_ms[(start + i) % IKUAI_CURVE_MAX];
+        if (ping < 0.0f) {
+            lost++;
+            have_previous = false;
+            continue;
+        }
+        sum += ping;
+        valid++;
+        if (have_previous) {
+            jitter_sum += fabsf(ping - previous);
+            pairs++;
+        }
+        previous = ping;
+        have_previous = true;
+    }
+    q.ready = curve->n >= 10;
+    q.loss_pct = (float)lost * 100.0f / (float)curve->n;
+    q.avg_ms = valid ? sum / (float)valid : 0.0f;
+    q.jitter_ms = pairs ? jitter_sum / (float)pairs : 0.0f;
+    s_quality = q;
+}
 
 // 焦点页/系统页数据刷新(每秒)
 static void pages_update(void) {
     lv_label_set_text(lbl_focus_num, s_last_d);
     lv_label_set_text(lbl_focus_unit, s_last_du);
     char line[64];
+
+    // Read every extended source once per UI tick so all pages share the same
+    // timestamp snapshot and WAN health is not inferred from API reachability.
+    ikuai_extra_t ex;
+    bool has_ex = false;
+#if APP_DEMO_MODE
+    uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000);
+    memset(&ex, 0, sizeof(ex));
+    ex.ok = true; has_ex = true;
+    ex.system_ts = now_sec; ex.wan_ts = now_sec;
+    ex.clients_ts = now_sec; ex.ac_ts = now_sec;
+    ex.cpu_temp_valid = true; ex.cpu_temp = 46;
+    ex.uptime_valid = true; ex.uptime_sec = 86400 * 3 + 3600 * 7;
+    ex.version_valid = true;
+    strncpy(ex.version, "3.7.21", sizeof(ex.version));
+    ex.wan_cnt = 1;
+    strncpy(ex.wan[0].name, "wan1", 12); strncpy(ex.wan[0].ip, "100.64.1.2", 16);
+    strncpy(ex.wan[0].gateway, "100.64.1.1", 16);
+    ex.wan[0].status_valid = true; ex.wan[0].ok = 1;
+    ex.wan[0].conn_valid = true; ex.wan[0].conn_cnt = 3284;
+    ex.wan[0].rate_valid = true;
+    ex.wan[0].down_bps = 6 * 1024 * 1024; ex.wan[0].up_bps = 1200 * 1024;
+    ex.wan[0].drop_valid = true;
+    ex.wan[0].down_packets = 500000; ex.wan[0].up_packets = 180000;
+    ex.wan[0].down_dropped = 12; ex.wan[0].up_dropped = 3;
+    ex.client_cnt = 3;
+    strncpy(ex.client[0].name, "Xiaomi-TV", 24); ex.client[0].down_valid = ex.client[0].up_valid = true; ex.client[0].down_bps = 6 * 1024 * 1024; ex.client[0].up_bps = 320 * 1024;
+    strncpy(ex.client[1].name, "MacBook-Pro", 24); ex.client[1].down_valid = ex.client[1].up_valid = true; ex.client[1].down_bps = 2400 * 1024; ex.client[1].up_bps = 860 * 1024;
+    strncpy(ex.client[2].name, "192.168.9.33", 24); ex.client[2].down_valid = ex.client[2].up_valid = true; ex.client[2].down_bps = 380 * 1024; ex.client[2].up_bps = 96 * 1024;
+    ex.ac_on = 1; ex.ap_online = 2; ex.ap_count = 2; ex.clt_2g = 7; ex.clt_5g = 9;
+    ex.clt_active = 14; ex.clt_inactive = 2; ex.clt_peak = 22;
+#else
+    has_ex = ikuai_get_extra(&ex);
+#endif
+    bool system_fresh = has_ex && sample_fresh(ex.system_ts, EXT_SAMPLE_MAX_AGE_SEC);
+    bool wan_fresh = has_ex && sample_fresh(ex.wan_ts, EXT_SAMPLE_MAX_AGE_SEC);
+    bool clients_fresh = has_ex && sample_fresh(ex.clients_ts, EXT_SAMPLE_MAX_AGE_SEC);
+    bool ac_fresh = has_ex && sample_fresh(ex.ac_ts, EXT_SAMPLE_MAX_AGE_SEC);
+    int wan_status_count = 0;
+    bool wan_any_online = false;
+    if (wan_fresh) {
+        for (int i = 0; i < ex.wan_cnt && i < 2; i++) {
+            if (ex.wan[i].status_valid) {
+                wan_status_count++;
+                if (ex.wan[i].ok) wan_any_online = true;
+            }
+        }
+    }
+    bool wan_sample_seen = has_ex && ex.wan_ts != 0;
+    const char *wan_state_text;
+    uint32_t wan_state_color;
+    if (!s_last_sys_ok) {
+        wan_state_text = s_wifi_ok ? "DATA OFFLINE" : "WIFI WARMING";
+        wan_state_color = s_wifi_ok ? CLR_RED : CLR_DIM;
+    } else if (!wan_sample_seen) {
+        wan_state_text = "WAN WARMING";
+        wan_state_color = CLR_DIM;
+    } else if (!wan_fresh) {
+        wan_state_text = "WAN STALE";
+        wan_state_color = CLR_YELLOW;
+    } else if (wan_status_count == 0) {
+        wan_state_text = "WAN NO DATA";
+        wan_state_color = CLR_DIM;
+    } else if (wan_any_online) {
+        wan_state_text = "WAN ONLINE";
+        wan_state_color = CLR_GREEN;
+    } else {
+        wan_state_text = "WAN OFFLINE";
+        wan_state_color = CLR_RED;
+    }
+    lv_label_set_text(lbl_status, wan_state_text);
+    lv_obj_set_style_bg_color(dot_status, lv_color_hex(wan_state_color), 0);
     snprintf(line, sizeof(line), "UP %s %s", s_last_u, s_last_uu);
     lv_label_set_text(lbl_focus_sub, line);
 
@@ -1206,38 +1469,78 @@ static void pages_update(void) {
     const char *net_status;
     const char *net_detail;
     const char *net_footer;
+    char quality_line[48];
+    if (s_quality.ready) {
+        snprintf(quality_line, sizeof(quality_line), "LOSS %.1f%% | AVG %.0f | JIT %.0fMS",
+                 (double)s_quality.loss_pct, (double)s_quality.avg_ms,
+                 (double)s_quality.jitter_ms);
+    } else {
+        snprintf(quality_line, sizeof(quality_line), "QUALITY WARMING");
+    }
     if (!s_last_sys_ok) {
         net_color = CLR_RED;
-        net_status = "WAN OFFLINE";
+        net_status = "DATA OFFLINE";
         if (s_wifi_ok) {
             link_failure_text(&net_detail, &net_footer);
         } else {
             net_detail = s_wifi_retry_count ? "WIFI RECONNECTING" : "WIFI CONNECTING";
             net_footer = s_wifi_retry_count ? "RETRY BACKOFF ACTIVE" : "WAITING FOR WIFI";
         }
+    } else if (!wan_sample_seen) {
+        net_color = CLR_DIM;
+        net_status = "WAN WARMING";
+        net_detail = "WAITING FOR LINE STATUS";
+        net_footer = "TRAFFIC DATA AVAILABLE";
+    } else if (!wan_fresh) {
+        net_color = CLR_YELLOW;
+        net_status = "WAN STALE";
+        net_detail = "LINE STATUS EXPIRED";
+        net_footer = "WAITING FOR REFRESH";
+    } else if (wan_status_count == 0) {
+        net_color = CLR_DIM;
+        net_status = "WAN NO DATA";
+        net_detail = "LINE STATUS MISSING";
+        net_footer = "CHECK IKUAI RESPONSE";
+    } else if (!wan_any_online) {
+        net_color = CLR_RED;
+        net_status = "WAN OFFLINE";
+        net_detail = "ALL LINES DOWN";
+        net_footer = "CHECK WAN LINKS";
     } else if (s_last_ping_ms < 0) {
         net_color = CLR_RED;
         net_status = "PING TIMEOUT";
         net_detail = "TRAFFIC DATA AVAILABLE";
         net_footer = "CHECK GATEWAY ICMP";
+    } else if (s_quality.ready && s_quality.loss_pct >= NET_LOSS_BAD_PCT) {
+        net_color = CLR_RED;
+        net_status = "DEGRADED";
+        net_detail = "PACKET LOSS";
+        net_footer = quality_line;
     } else if (s_last_ping_ms >= 80) {
         net_color = CLR_PING;
         net_status = "DEGRADED";
         net_detail = "HIGH LATENCY";
-        net_footer = "WATCH PING TREND";
+        net_footer = quality_line;
+    } else if (s_quality.ready &&
+               (s_quality.loss_pct >= NET_LOSS_WARN_PCT ||
+                s_quality.jitter_ms >= NET_JITTER_WARN_MS)) {
+        net_color = CLR_YELLOW;
+        net_status = "DEGRADED";
+        net_detail = "LINK UNSTABLE";
+        net_footer = quality_line;
     } else {
         net_color = CLR_GREEN;
         net_status = "WAN ONLINE";
         net_detail = "NETWORK STABLE";
-        net_footer = "NO ACTIVE ALERTS";
+        net_footer = quality_line;
     }
     lv_label_set_text(lbl_net_status, net_status);
     lv_label_set_text(lbl_net_detail, net_detail);
     lv_label_set_text(lbl_net_footer, net_footer);
     lv_obj_set_style_text_color(lbl_net_status, lv_color_hex(net_color), 0);
     lv_obj_set_style_text_color(lbl_net_detail, lv_color_hex(net_color), 0);
-    lv_label_set_text(lbl_dual_state, s_last_sys_ok ? "WAN ONLINE" : "WAN OFFLINE");
-    lv_obj_set_style_text_color(lbl_dual_state, lv_color_hex(s_last_sys_ok ? CLR_GREEN : CLR_RED), 0);
+    lv_label_set_text(lbl_dual_state, wan_state_text);
+    lv_obj_set_style_text_color(lbl_dual_state, lv_color_hex(wan_state_color), 0);
 
     if (s_last_ping_ms < 0) snprintf(line, sizeof(line), "GW --");
     else snprintf(line, sizeof(line), "GW %.0f", (double)s_last_ping_ms);
@@ -1247,19 +1550,60 @@ static void pages_update(void) {
     snprintf(line, sizeof(line), "U %s", s_last_u);
     lv_label_set_text(lbl_net_up, line);
 
-    lv_label_set_text(lbl_sys_ip, s_ip);
-    snprintf(line, sizeof(line), "%ld", s_last_clients < 0 ? 0 : s_last_clients);
-    lv_label_set_text(lbl_sys_clients, line);
-    uint32_t up = (uint32_t)(esp_timer_get_time() / 1000000);
-    snprintf(line, sizeof(line), "%luh %02lum", (unsigned long)(up / 3600), (unsigned long)((up % 3600) / 60));
-    lv_label_set_text(lbl_sys_uptime, line);
-    snprintf(line, sizeof(line), "%u KB", (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
-    lv_label_set_text(lbl_sys_heap, line);
+    if (s_last_sys_ok) {
+        char count[16];
+        lv_label_set_text(lbl_load_state, "LIVE");
+        lv_obj_set_style_text_color(lbl_load_state, lv_color_hex(CLR_GREEN), 0);
+        if (s_last_conn_valid) {
+            fmt_count(s_last_conn, count, sizeof(count));
+            lv_label_set_text(lbl_load_conn, count);
+        } else lv_label_set_text(lbl_load_conn, "--");
+        if (s_last_tcp_conn_valid) {
+            fmt_count(s_last_tcp_conn, count, sizeof(count));
+            lv_label_set_text(lbl_load_tcp, count);
+        } else lv_label_set_text(lbl_load_tcp, "--");
+        if (s_last_udp_conn_valid) {
+            fmt_count(s_last_udp_conn, count, sizeof(count));
+            lv_label_set_text(lbl_load_udp, count);
+        } else lv_label_set_text(lbl_load_udp, "--");
+        if (s_last_icmp_conn_valid) {
+            fmt_count(s_last_icmp_conn, count, sizeof(count));
+            lv_label_set_text(lbl_load_icmp, count);
+        } else lv_label_set_text(lbl_load_icmp, "--");
+        if (s_quality.ready) {
+            if (s_last_clients >= 0)
+                snprintf(line, sizeof(line), "%ld CLIENTS | LOSS %.1f%% | JIT %.0fMS",
+                         s_last_clients, (double)s_quality.loss_pct,
+                         (double)s_quality.jitter_ms);
+            else
+                snprintf(line, sizeof(line), "-- CLIENTS | LOSS %.1f%% | JIT %.0fMS",
+                         (double)s_quality.loss_pct, (double)s_quality.jitter_ms);
+        } else {
+            if (s_last_clients >= 0)
+                snprintf(line, sizeof(line), "%ld CLIENTS | QUALITY WARMING",
+                         s_last_clients);
+            else
+                snprintf(line, sizeof(line), "-- CLIENTS | QUALITY WARMING");
+        }
+        lv_label_set_text(lbl_load_footer, line);
+    } else {
+        lv_label_set_text(lbl_load_state, s_wifi_ok ? "OFFLINE" : "WARMING");
+        lv_obj_set_style_text_color(lbl_load_state,
+            lv_color_hex(s_wifi_ok ? CLR_RED : CLR_DIM), 0);
+        lv_label_set_text(lbl_load_conn, "--");
+        lv_label_set_text(lbl_load_tcp, "--");
+        lv_label_set_text(lbl_load_udp, "--");
+        lv_label_set_text(lbl_load_icmp, "--");
+        lv_label_set_text(lbl_load_footer, "-- CLIENTS | LOSS -- | JIT --");
+    }
 
     lv_label_set_text(lbl_health_status, s_last_sys_ok ? "ONLINE" : "OFFLINE");
     lv_obj_set_style_text_color(lbl_health_status,
         lv_color_hex(s_last_sys_ok ? CLR_GREEN : CLR_RED), 0);
-    snprintf(line, sizeof(line), "%ld CLIENTS", s_last_clients < 0 ? 0 : s_last_clients);
+    if (s_last_clients >= 0)
+        snprintf(line, sizeof(line), "%ld CLIENTS", s_last_clients);
+    else
+        snprintf(line, sizeof(line), "-- CLIENTS");
     lv_label_set_text(lbl_top_count, line);
     snprintf(line, sizeof(line), "TOTAL DOWN %s%s | UP %s%s",
              s_last_d, s_last_du, s_last_u, s_last_uu);
@@ -1267,7 +1611,7 @@ static void pages_update(void) {
 
     // 焦点页:活跃点亮/静默降灰 + 峰值标记
     {
-        uint32_t pk = s_peak_down;
+        uint32_t pk = s_focus_peak_down;
         bool act = s_last_active;
         set_active_style(lbl_focus_num, lbl_focus_unit, CLR_DOWN, act);
         if (pk >= 1024) {
@@ -1276,43 +1620,24 @@ static void pages_update(void) {
             char pl[40];
             snprintf(pl, sizeof(pl), "PEAK %s %s *", pv, pu);
             lv_label_set_text(lbl_focus_peak, pl);
+        } else {
+            lv_label_set_text(lbl_focus_peak, "");
         }
     }
 
     // ── 扩展页(健康/WAN/排行/AC)──
-    ikuai_extra_t ex;
-    bool has_ex = false;
-#if APP_DEMO_MODE
-    uint32_t now_sec = (uint32_t)(esp_timer_get_time() / 1000000);
-    memset(&ex, 0, sizeof(ex));
-    ex.ok = true; has_ex = true;
-    ex.system_ts = now_sec; ex.wan_ts = now_sec;
-    ex.clients_ts = now_sec; ex.ac_ts = now_sec;
-    ex.cpu_temp = 46; ex.uptime_sec = 86400 * 3 + 3600 * 7;
-    strncpy(ex.version, "3.7.21", sizeof(ex.version));
-    ex.wan_cnt = 1;
-    strncpy(ex.wan[0].name, "wan1", 12); strncpy(ex.wan[0].ip, "100.64.1.2", 16);
-    strncpy(ex.wan[0].gateway, "100.64.1.1", 16); ex.wan[0].ok = 1;
-    ex.client_cnt = 3;
-    strncpy(ex.client[0].name, "Xiaomi-TV", 24); ex.client[0].down_bps = 6 * 1024 * 1024;
-    strncpy(ex.client[1].name, "MacBook-Pro", 24); ex.client[1].down_bps = 2400 * 1024;
-    strncpy(ex.client[2].name, "192.168.9.33", 24); ex.client[2].down_bps = 380 * 1024;
-    ex.ac_on = 1; ex.ap_online = 2; ex.ap_count = 2; ex.clt_2g = 7; ex.clt_5g = 9;
-#else
-    has_ex = ikuai_get_extra(&ex);
-#endif
-    bool system_fresh = has_ex && sample_fresh(ex.system_ts, 10);
-    bool wan_fresh = has_ex && sample_fresh(ex.wan_ts, 10);
-    bool clients_fresh = has_ex && sample_fresh(ex.clients_ts, 10);
-    bool ac_fresh = has_ex && sample_fresh(ex.ac_ts, 10);
     // 健康页:CPU/MEM 用 1s 实时数据;温度/运行时间用扩展数据
     {
         ikuai_sys_t sy;
         if (ikuai_get_sys(&sy) && sy.ok) {
-            snprintf(line, sizeof(line), "%.0f", (double)sy.cpu_pct);
-            lv_label_set_text(lbl_cpu, line);
-            snprintf(line, sizeof(line), "%.0f", (double)sy.mem_pct);
-            lv_label_set_text(lbl_mem, line);
+            if (sy.cpu_valid) {
+                snprintf(line, sizeof(line), "%.0f", (double)sy.cpu_pct);
+                lv_label_set_text(lbl_cpu, line);
+            } else lv_label_set_text(lbl_cpu, "--");
+            if (sy.mem_valid) {
+                snprintf(line, sizeof(line), "%.0f", (double)sy.mem_pct);
+                lv_label_set_text(lbl_mem, line);
+            } else lv_label_set_text(lbl_mem, "--");
         } else {
             lv_label_set_text(lbl_cpu, "--");
             lv_label_set_text(lbl_mem, "--");
@@ -1322,87 +1647,171 @@ static void pages_update(void) {
     }
     if (has_ex) {
         if (system_fresh) {
-        snprintf(line, sizeof(line), "%.0f C", (double)ex.cpu_temp);
-        lv_label_set_text(lbl_temp, line);
-        uint32_t d = ex.uptime_sec / 86400, h = (ex.uptime_sec % 86400) / 3600;
-        snprintf(line, sizeof(line), "%lud %02luh", (unsigned long)d, (unsigned long)h);
-        lv_label_set_text(lbl_uptime, line);
-        snprintf(line, sizeof(line), "%ld CLT | %uK HEAP | V%s",
-                 s_last_clients < 0 ? 0 : s_last_clients,
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024),
-                 ex.version[0] ? ex.version : "--");
+        if (ex.cpu_temp_valid) {
+            snprintf(line, sizeof(line), "%.0f C", (double)ex.cpu_temp);
+            lv_label_set_text(lbl_temp, line);
+            lv_obj_set_style_text_color(lbl_temp, lv_color_hex(CLR_TEXT), 0);
+        } else {
+            lv_label_set_text(lbl_temp, "NO DATA");
+            lv_obj_set_style_text_color(lbl_temp, lv_color_hex(CLR_DIM), 0);
+        }
+        if (ex.uptime_valid) {
+            uint32_t d = ex.uptime_sec / 86400;
+            uint32_t h = (ex.uptime_sec % 86400) / 3600;
+            snprintf(line, sizeof(line), "%lud %02luh", (unsigned long)d,
+                     (unsigned long)h);
+            lv_label_set_text(lbl_uptime, line);
+        } else {
+            lv_label_set_text(lbl_uptime, "NO DATA");
+        }
+        char rx[16] = "--", tx[16] = "--";
+        if (s_last_totals_valid) {
+            fmt_bytes(s_last_total_down, rx, sizeof(rx));
+            fmt_bytes(s_last_total_up, tx, sizeof(tx));
+        }
+        snprintf(line, sizeof(line), "RX %s | TX %s | V%s",
+                 rx, tx, ex.version_valid ? ex.version : "--");
         lv_label_set_text(lbl_health_meta, line);
         } else {
             lv_label_set_text(lbl_temp, "STALE");
+            lv_obj_set_style_text_color(lbl_temp, lv_color_hex(CLR_YELLOW), 0);
             lv_label_set_text(lbl_uptime, "STALE");
-            snprintf(line, sizeof(line), "%ld CLT | %uK HEAP | VSTALE",
-                     s_last_clients < 0 ? 0 : s_last_clients,
-                     (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+            snprintf(line, sizeof(line), "RX -- | TX -- | VSTALE");
             lv_label_set_text(lbl_health_meta, line);
         }
         // WAN 页
         for (int i = 0; i < 2; i++) {
             bool on = i < ex.wan_cnt;
-            bool ok = on && ex.wan[i].ok;
-            lv_label_set_text(lbl_wan[i][0], !wan_fresh ? "STALE" : (ok ? "ONLINE" : "OFFLINE"));
+            bool status_valid = on && ex.wan[i].status_valid;
+            bool ok = status_valid && ex.wan[i].ok;
+            const char *state = !wan_fresh ? "STALE" :
+                (!on ? "UNUSED" : (!status_valid ? "NO DATA" :
+                 (ok ? "ONLINE" : "OFFLINE")));
+            uint32_t state_color = !wan_fresh ? CLR_YELLOW :
+                (!on ? CLR_IDLE : (!status_valid ? CLR_DIM :
+                 (ok ? CLR_GREEN : CLR_RED)));
+            lv_label_set_text(lbl_wan[i][0], state);
             lv_obj_set_style_text_color(lbl_wan[i][0],
-                lv_color_hex(!wan_fresh ? CLR_PING : (ok ? CLR_GREEN : CLR_RED)), 0);
-            lv_label_set_text(lbl_wan[i][1], wan_fresh && on ? ex.wan[i].ip : "--");
-            lv_label_set_text(lbl_wan[i][2], wan_fresh && on ? ex.wan[i].gateway : "--");
-            lv_obj_set_style_bg_color(lbl_wan_dot[i],
-                lv_color_hex(!wan_fresh ? CLR_PING : (ok ? CLR_GREEN : CLR_RED)), 0);
+                lv_color_hex(state_color), 0);
+            lv_obj_set_style_bg_color(lbl_wan_dot[i], lv_color_hex(state_color), 0);
+            if (wan_fresh && on) {
+                if (ex.wan[i].rate_valid) {
+                    char down[16], up[16];
+                    fmt_rate_compact('D', ex.wan[i].down_bps,
+                                     &s_wan_down_unit[i], down, sizeof(down));
+                    fmt_rate_compact('U', ex.wan[i].up_bps,
+                                     &s_wan_up_unit[i], up, sizeof(up));
+                    lv_label_set_text(lbl_wan[i][1], down);
+                    lv_label_set_text(lbl_wan[i][2], up);
+                } else {
+                    s_wan_down_unit[i] = s_wan_up_unit[i] = RATE_UNIT_AUTO;
+                    lv_label_set_text(lbl_wan[i][1], "D NO DATA");
+                    lv_label_set_text(lbl_wan[i][2], "U NO DATA");
+                }
+                char conn[12] = "--";
+                char drop[16] = "--";
+                if (ex.wan[i].conn_valid)
+                    snprintf(conn, sizeof(conn), "%lu",
+                             (unsigned long)ex.wan[i].conn_cnt);
+                if (ex.wan[i].drop_valid) {
+                    uint64_t packets = ex.wan[i].down_packets + ex.wan[i].up_packets;
+                    uint64_t dropped = ex.wan[i].down_dropped + ex.wan[i].up_dropped;
+                    double drop_pct = packets + dropped ?
+                        (double)dropped * 100.0 / (double)(packets + dropped) : 0.0;
+                    snprintf(drop, sizeof(drop), "%.2f%%", drop_pct);
+                }
+                snprintf(line, sizeof(line), "C %s | DROP %s | IP %s",
+                         conn, drop, ex.wan[i].ip[0] ? ex.wan[i].ip : "--");
+                lv_label_set_text(lbl_wan[i][3], line);
+            } else {
+                s_wan_down_unit[i] = s_wan_up_unit[i] = RATE_UNIT_AUTO;
+                lv_label_set_text(lbl_wan[i][1], wan_fresh ? "D--" : "D STALE");
+                lv_label_set_text(lbl_wan[i][2], wan_fresh ? "U--" : "U STALE");
+                lv_label_set_text(lbl_wan[i][3], wan_fresh ? "C -- | DROP -- | IP --" : "STALE DATA");
+            }
         }
         // 排行页
         for (int i = 0; i < 3; i++) {
             if (clients_fresh && i < ex.client_cnt) {
                 lv_label_set_text(lbl_cli[i][0], ex.client[i].name);
-                char v[16]; const char *u;
-                fmt_rate(ex.client[i].down_bps, &s_client_unit[i], v, sizeof(v), &u);
-                snprintf(line, sizeof(line), "%s %s", v, u);
-                lv_label_set_text(lbl_cli[i][1], line);
+                char down[16], up[16];
+                if (ex.client[i].down_valid) {
+                    fmt_rate_compact('D', ex.client[i].down_bps,
+                                     &s_client_down_unit[i], down, sizeof(down));
+                    lv_label_set_text(lbl_cli[i][1], down);
+                } else {
+                    s_client_down_unit[i] = RATE_UNIT_AUTO;
+                    lv_label_set_text(lbl_cli[i][1], "D--");
+                }
+                if (ex.client[i].up_valid) {
+                    fmt_rate_compact('U', ex.client[i].up_bps,
+                                     &s_client_up_unit[i], up, sizeof(up));
+                    lv_label_set_text(lbl_cli[i][2], up);
+                } else {
+                    s_client_up_unit[i] = RATE_UNIT_AUTO;
+                    lv_label_set_text(lbl_cli[i][2], "U--");
+                }
             } else {
-                s_client_unit[i] = RATE_UNIT_AUTO;
+                s_client_down_unit[i] = s_client_up_unit[i] = RATE_UNIT_AUTO;
                 lv_label_set_text(lbl_cli[i][0], clients_fresh ? "--" : "STALE");
-                lv_label_set_text(lbl_cli[i][1], clients_fresh ? "--" : "STALE");
+                lv_label_set_text(lbl_cli[i][1], clients_fresh ? "D--" : "STALE");
+                lv_label_set_text(lbl_cli[i][2], clients_fresh ? "U--" : "STALE");
             }
         }
         // AC 页
         if (ac_fresh) {
             lv_label_set_text(lbl_ac, ex.ac_on ? "ON" : "OFF");
+            lv_obj_set_style_text_color(lbl_ac,
+                lv_color_hex(ex.ac_on ? CLR_GREEN : CLR_IDLE), 0);
             snprintf(line, sizeof(line), "%d / %d", ex.ap_online, ex.ap_count);
             lv_label_set_text(lbl_ap, line);
+            uint32_t ap_color = !ex.ac_on ? CLR_IDLE :
+                (ex.ap_count <= 0 ? CLR_DIM :
+                 (ex.ap_online == ex.ap_count ? CLR_GREEN :
+                  (ex.ap_online > 0 ? CLR_YELLOW : CLR_RED)));
+            lv_obj_set_style_text_color(lbl_ap, lv_color_hex(ap_color), 0);
             snprintf(line, sizeof(line), "%02d", ex.clt_2g);
             lv_label_set_text(lbl_clt_2g, line);
             snprintf(line, sizeof(line), "%02d", ex.clt_5g);
             lv_label_set_text(lbl_clt_5g, line);
+            snprintf(line, sizeof(line), "ACTIVE %d | IDLE %d | PEAK %d",
+                     ex.clt_active, ex.clt_inactive, ex.clt_peak);
+            lv_label_set_text(lbl_ac_meta, line);
         } else {
             lv_label_set_text(lbl_ac, "STALE");
             lv_label_set_text(lbl_ap, "STALE");
+            lv_obj_set_style_text_color(lbl_ac, lv_color_hex(CLR_YELLOW), 0);
+            lv_obj_set_style_text_color(lbl_ap, lv_color_hex(CLR_YELLOW), 0);
             lv_label_set_text(lbl_clt_2g, "--");
             lv_label_set_text(lbl_clt_5g, "--");
+            lv_label_set_text(lbl_ac_meta, "ACTIVE -- | IDLE -- | PEAK --");
         }
     } else {
         lv_label_set_text(lbl_temp, "--");
+        lv_obj_set_style_text_color(lbl_temp, lv_color_hex(CLR_DIM), 0);
         lv_label_set_text(lbl_uptime, "--");
-        snprintf(line, sizeof(line), "%ld CLT | %uK HEAP | V--",
-                 s_last_clients < 0 ? 0 : s_last_clients,
-                 (unsigned)(heap_caps_get_free_size(MALLOC_CAP_8BIT) / 1024));
+        snprintf(line, sizeof(line), "RX -- | TX -- | V--");
         lv_label_set_text(lbl_health_meta, line);
         for (int i = 0; i < 2; i++) {
             lv_label_set_text(lbl_wan[i][0], "OFFLINE");
             lv_obj_set_style_text_color(lbl_wan[i][0], lv_color_hex(CLR_RED), 0);
             lv_label_set_text(lbl_wan[i][1], "--");
             lv_label_set_text(lbl_wan[i][2], "--");
+            lv_label_set_text(lbl_wan[i][3], "C -- | DROP -- | IP --");
             lv_obj_set_style_bg_color(lbl_wan_dot[i], lv_color_hex(CLR_RED), 0);
         }
         for (int i = 0; i < 3; i++) {
             lv_label_set_text(lbl_cli[i][0], "--");
             lv_label_set_text(lbl_cli[i][1], "--");
+            lv_label_set_text(lbl_cli[i][2], "--");
         }
         lv_label_set_text(lbl_ac, "--");
         lv_label_set_text(lbl_ap, "--");
         lv_label_set_text(lbl_clt_2g, "--");
         lv_label_set_text(lbl_clt_5g, "--");
+        lv_label_set_text(lbl_ac_meta, "ACTIVE -- | IDLE -- | PEAK --");
+        lv_obj_set_style_text_color(lbl_ac, lv_color_hex(CLR_DIM), 0);
+        lv_obj_set_style_text_color(lbl_ap, lv_color_hex(CLR_DIM), 0);
     }
 }
 
@@ -1441,6 +1850,18 @@ static void ui_update(void) {
     set_ping_style(ping_ms);
     strncpy(s_last_d, d, sizeof(s_last_d)); strncpy(s_last_u, u, sizeof(s_last_u));
     s_last_du = du; s_last_uu = uu; s_last_clients = 18;
+    s_last_conn_valid = s_last_tcp_conn_valid = true;
+    s_last_udp_conn_valid = s_last_icmp_conn_valid = true;
+    s_last_conn = 3284;
+    s_last_tcp_conn = 2470;
+    s_last_udp_conn = 810;
+    s_last_icmp_conn = 4;
+    s_last_totals_valid = true;
+    s_last_total_down = 137ULL * 1024 * 1024 * 1024;
+    s_last_total_up = 42ULL * 1024 * 1024 * 1024;
+    s_quality = (network_quality_t) {
+        .ready = true, .loss_pct = 0.0f, .avg_ms = ping_ms, .jitter_ms = 2.0f
+    };
     lv_label_set_text(lbl_online, "18 CLIENTS");
     lv_label_set_text(lbl_status, "DEMO ONLINE");
     lv_obj_set_style_bg_color(dot_status, lv_color_hex(CLR_GREEN), 0);
@@ -1448,9 +1869,17 @@ static void ui_update(void) {
     lv_label_set_text(lbl_ping, line);
     lv_label_set_text(lbl_ip, "IP DEMO");
 
-    s_track[TRACK_DOWN].target = (float)d_tri / 9.0f;
-    s_track[TRACK_UP].target = (float)u_tri / 7.0f;
-    s_track[TRACK_PING].target = ping_ms / 47.0f;
+    static uint32_t demo_down_ring[IKUAI_CURVE_MAX];
+    static int demo_down_head;
+    static int demo_down_count;
+    demo_down_ring[demo_down_head] = down_bps;
+    demo_down_head = (demo_down_head + 1) % IKUAI_CURVE_MAX;
+    if (demo_down_count < IKUAI_CURVE_MAX) demo_down_count++;
+    s_focus_peak_down = raw_peak_u32(demo_down_ring, demo_down_count);
+
+    s_track[TRACK_DOWN].target = normalize_rate(down_bps, APP_CURVE_DOWN_CEILING_BPS);
+    s_track[TRACK_UP].target = normalize_rate(up_bps, APP_CURVE_UP_CEILING_BPS);
+    s_track[TRACK_PING].target = fminf(ping_ms / APP_CURVE_PING_CEILING_MS, 1.0f);
     meteor_note_rate(down_bps);
     set_curve_trust(DATA_TRUST_DEMO, true);
     pages_update();
@@ -1478,23 +1907,30 @@ static void ui_update(void) {
         set_active_style(lbl_up, lbl_up_unit, CLR_UP, s_up_active);
         meteor_note_rate(s.down_bps);
         strncpy(s_last_d, d, sizeof(s_last_d)); strncpy(s_last_u, u, sizeof(s_last_u));
-        s_last_du = du; s_last_uu = uu; s_last_clients = (long)s.online_cnt;
+        s_last_du = du; s_last_uu = uu;
+        s_last_clients = s.online_valid ? (long)s.online_cnt : -1;
+        s_last_conn_valid = s.conn_valid;
+        s_last_tcp_conn_valid = s.tcp_conn_valid;
+        s_last_udp_conn_valid = s.udp_conn_valid;
+        s_last_icmp_conn_valid = s.icmp_conn_valid;
+        s_last_conn = s.conn_cnt;
+        s_last_tcp_conn = s.tcp_conn_cnt;
+        s_last_udp_conn = s.udp_conn_cnt;
+        s_last_icmp_conn = s.icmp_conn_cnt;
+        s_last_totals_valid = s.totals_valid;
+        s_last_total_down = s.total_down;
+        s_last_total_up = s.total_up;
         char line[32];
-        snprintf(line, sizeof(line), "%lu CLIENTS", (unsigned long)s.online_cnt);
+        if (s.online_valid)
+            snprintf(line, sizeof(line), "%lu CLIENTS", (unsigned long)s.online_cnt);
+        else
+            snprintf(line, sizeof(line), "-- CLIENTS");
         lv_label_set_text(lbl_online, line);
         lv_label_set_text(lbl_status, "WAN ONLINE");
         lv_obj_set_style_bg_color(dot_status, lv_color_hex(CLR_GREEN), 0);
 
-        if (s.down_bps > s_peak_down) s_peak_down = s.down_bps;
-        else s_peak_down = (uint32_t)(((uint64_t)s_peak_down * 63 + s.down_bps) / 64);
-        if (s_peak_down < 1024) s_peak_down = 1024;
-
-        if (s.up_bps > s_peak_up) s_peak_up = s.up_bps;
-        else s_peak_up = (uint32_t)(((uint64_t)s_peak_up * 63 + s.up_bps) / 64);
-        if (s_peak_up < 1024) s_peak_up = 1024;
-
-        s_track[TRACK_DOWN].target = (float)s.down_bps / (float)s_peak_down;
-        s_track[TRACK_UP].target = (float)s.up_bps / (float)s_peak_up;
+        s_track[TRACK_DOWN].target = normalize_rate(s.down_bps, APP_CURVE_DOWN_CEILING_BPS);
+        s_track[TRACK_UP].target = normalize_rate(s.up_bps, APP_CURVE_UP_CEILING_BPS);
     } else {
         lv_label_set_text(lbl_down, "--");
         lv_label_set_text(lbl_up, "--");
@@ -1519,6 +1955,11 @@ static void ui_update(void) {
         s_last_du = "";
         s_last_uu = "";
         s_last_clients = -1;
+        s_last_conn_valid = s_last_tcp_conn_valid = false;
+        s_last_udp_conn_valid = s_last_icmp_conn_valid = false;
+        s_last_conn = s_last_tcp_conn = s_last_udp_conn = s_last_icmp_conn = 0;
+        s_last_totals_valid = false;
+        s_last_total_down = s_last_total_up = 0;
         set_active_style(lbl_down, lbl_down_unit, CLR_DOWN, false);
         set_active_style(lbl_up, lbl_up_unit, CLR_UP, false);
         set_ping_style(-1);
@@ -1528,9 +1969,11 @@ static void ui_update(void) {
     }
 
     if (ikuai_get_curve(&c) && c.n > 0) {
+        update_network_quality(&c);
         set_curve_trust(!sys_ok ? DATA_TRUST_STALE :
                         (c.n < 10 ? DATA_TRUST_WARMING : DATA_TRUST_LIVE),
                         c.n >= 10);
+        s_focus_peak_down = raw_peak_u32(c.down, c.n);
         int slot = (c.head - 1 + IKUAI_CURVE_MAX) % IKUAI_CURVE_MAX;
         float p = c.ping_ms[slot];
         if (p < 0) {
@@ -1545,12 +1988,10 @@ static void ui_update(void) {
             lv_label_set_text(lbl_ping, line);
             set_ping_style(p);
             s_last_ping_ms = p;
-            if (p > s_peak_ping) s_peak_ping = p;
-            else s_peak_ping = s_peak_ping * 0.985f + p * 0.015f;
-            if (s_peak_ping < 50.0f) s_peak_ping = 50.0f;
-            s_track[TRACK_PING].target = p / s_peak_ping;
+            s_track[TRACK_PING].target = fminf(p / APP_CURVE_PING_CEILING_MS, 1.0f);
         }
     } else {
+        update_network_quality(NULL);
         lv_label_set_text(lbl_ping, "GW -- MS");
         set_ping_style(-1);
         s_last_ping_ms = -1;
@@ -1569,19 +2010,9 @@ static void ui_update(void) {
     pages_update();
 }
 
-static lv_timer_t *s_ui_timer;
-
 static void ui_timer_cb(lv_timer_t *t) {
     ui_update();
     night_dim_poll();
-
-    uint32_t now_ms = (uint32_t)(esp_timer_get_time() / 1000);
-    if (s_dot_feedback_until_ms &&
-        (int32_t)(now_ms - s_dot_feedback_until_ms) >= 0) {
-        s_dot_feedback_until_ms = 0;
-        if (s_page >= 0 && s_page < PAGE_COUNT)
-            lv_obj_set_style_bg_color(s_dots[s_page], lv_color_hex(CLR_YELLOW), 0);
-    }
 
     // 60s 无操作自动回主页(摆件的归宿感)
     if (s_page != 0 && s_last_key_ms &&
@@ -1592,27 +2023,52 @@ static void ui_timer_cb(lv_timer_t *t) {
     // T-Display-S3 无 WS2812：状态由屏上状态点与文案承担
     // heap 监控（30s）
     static uint32_t s_last_heap_log = 0;
-    static uint32_t s_min_heap = 0xFFFFFFFF;
+    static uint32_t s_min_internal_heap = 0xFFFFFFFF;
     static uint32_t s_last_curve_frames = 0;
     uint32_t sec_now = (uint32_t)(esp_timer_get_time() / 1000000);
     if (sec_now - s_last_heap_log >= 30) {
         uint32_t elapsed = sec_now - s_last_heap_log;
         s_last_heap_log = sec_now;
         uint32_t free8 = (uint32_t)heap_caps_get_free_size(MALLOC_CAP_8BIT);
-        size_t largest = heap_caps_get_largest_free_block(MALLOC_CAP_8BIT);
+        uint32_t internal_free = (uint32_t)internal_heap_free();
+        size_t internal_largest = heap_caps_get_largest_free_block(
+            MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
         uint32_t frame_delta = s_curve_frames - s_last_curve_frames;
         s_last_curve_frames = s_curve_frames;
         uint32_t fps_x10 = elapsed ? frame_delta * 10 / elapsed : 0;
-        if (free8 < s_min_heap) s_min_heap = free8;
-        ESP_LOGI(TAG, "heap free=%u min=%u largest=%u curve_fps=%u.%u",
-                 (unsigned)free8, (unsigned)s_min_heap, (unsigned)largest,
-                 (unsigned)(fps_x10 / 10), (unsigned)(fps_x10 % 10));
+        if (internal_free < s_min_internal_heap) s_min_internal_heap = internal_free;
+        ESP_LOGI(TAG,
+                 "heap8_free=%u internal_free=%u internal_min=%u "
+                 "internal_largest=%u curve_fps=%u.%u conn=%u "
+                 "loss=%.1f jitter=%.1f",
+                 (unsigned)free8, (unsigned)internal_free,
+                 (unsigned)s_min_internal_heap, (unsigned)internal_largest,
+                 (unsigned)(fps_x10 / 10), (unsigned)(fps_x10 % 10),
+                 (unsigned)s_last_conn, (double)s_quality.loss_pct,
+                 (double)s_quality.jitter_ms);
     }
 
 }
 
 static void roll_timer_cb(lv_timer_t *t) {
-    curve_roll();
+    (void)t;
+    static int64_t last_us;
+    static float pending_sec;
+    const float step_sec = 1.0f / CURVE_FPS;
+    int64_t now_us = esp_timer_get_time();
+    float elapsed_sec = step_sec;
+    if (last_us != 0) {
+        elapsed_sec = (float)(now_us - last_us) / 1000000.0f;
+    }
+    last_us = now_us;
+    if (elapsed_sec > 0.120f) elapsed_sec = 0.120f;
+    if (elapsed_sec < 0.0f) elapsed_sec = 0.0f;
+
+    pending_sec += elapsed_sec;
+    while (pending_sec >= step_sec) {
+        curve_roll(step_sec);
+        pending_sec -= step_sec;
+    }
 }
 
 static void lv_tick_cb(void *arg) { lv_tick_inc(1); }
@@ -1620,6 +2076,12 @@ static void lv_tick_cb(void *arg) { lv_tick_inc(1); }
 static void ui_task(void *arg) {
     lv_init();
     lv_port_disp_init();
+
+    canvas_draw_buf_init_psram(&cvs_curve, CURVE_W, CURVE_H);
+    canvas_draw_buf_init_psram(&cvs_curve2, CURVE2_W, CURVE2_H);
+    canvas_draw_buf_init_psram(&cvs_dual_down, DUAL_CURVE_W, DUAL_CURVE_H);
+    canvas_draw_buf_init_psram(&cvs_dual_up, DUAL_CURVE_W, DUAL_CURVE_H);
+    canvas_draw_buf_init_psram(&cvs_meteor, METEOR_W, METEOR_H);
 
     s_c_bg = RGB565(0x00, 0x00, 0x00);
     s_c_grid = RGB565(0x00, 0x00, 0x00);
@@ -1659,8 +2121,8 @@ static void ui_task(void *arg) {
     ESP_ERROR_CHECK(esp_timer_create(&tmr_args, &tmr));
     ESP_ERROR_CHECK(esp_timer_start_periodic(tmr, 1000));
 
-    s_ui_timer = lv_timer_create(ui_timer_cb, 1000, NULL);
-    s_roll_timer = lv_timer_create(roll_timer_cb, 1000 / CURVE_FPS, NULL);
+    lv_timer_create(ui_timer_cb, 1000, NULL);
+    lv_timer_create(roll_timer_cb, 1000 / CURVE_FPS, NULL);
 
     for (;;) {
         if (!backlight_ready && lv_port_disp_first_flush_done()) {
@@ -1689,9 +2151,11 @@ void widget_start(void) {
     wifi_start();
     ikuai_monitor_start();
 #endif
-    ESP_LOGI(TAG, "heap at start: free=%u largest=%u",
+    ESP_LOGI(TAG, "heap at start: heap8_free=%u internal_free=%u internal_largest=%u",
              (unsigned)heap_caps_get_free_size(MALLOC_CAP_8BIT),
-             (unsigned)heap_caps_get_largest_free_block(MALLOC_CAP_8BIT));
+             (unsigned)internal_heap_free(),
+             (unsigned)heap_caps_get_largest_free_block(
+                 MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT));
     // LVGL's widget construction/render path needs more than a 4K-word stack,
     // while Wi-Fi/TLS already consumes the scarce internal RAM.  Keep the
     // task control block internal but place the UI worker stack in PSRAM.

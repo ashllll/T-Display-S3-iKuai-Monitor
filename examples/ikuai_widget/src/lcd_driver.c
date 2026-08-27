@@ -28,7 +28,7 @@ static const char *TAG = "lcd";
 static const int s_data_pins[8] = { 39, 40, 41, 42, 45, 46, 47, 48 };
 
 #define PCLK_HZ     (16 * 1000 * 1000)
-#define BL_MAX_PCT  100   // 16 级背光映射到 0~100%，应用可按环境调节
+#define BL_MAX_PCT  50    // 限制最高背光为 50%，避免小屏近距离过亮
 
 // 官方 T-Display-S3 工厂程序使用竖屏 GRAM 偏移 (0, 35)，
 // 再通过 swap_xy 转为横屏 320x170。
@@ -132,7 +132,12 @@ void lcd_flush_area(int x0, int y0, int x1, int y1, const void *data) {
 void lcd_init(void) {
     ESP_LOGI(TAG, "ST7789 i80 init (170x320)");
 
-    // 1) 外设总电源：必须最先拉高（官方重点注意事项 #1）
+    // Hold the external backlight controller low before powering the panel.
+    // GPIO reset state is not a sufficient contract across cold boot, EN reset,
+    // and software reset paths.
+    bl_init();
+
+    // 1) 外设总电源：背光已关闭后再拉高（官方重点注意事项 #1）
     gpio_config_t pwr = {
         .pin_bit_mask = 1ULL << PIN_PWR,
         .mode = GPIO_MODE_OUTPUT,
@@ -212,7 +217,5 @@ void lcd_init(void) {
     }
 
     ESP_ERROR_CHECK(esp_lcd_panel_disp_on_off(s_panel, true));
-
-    bl_init();
     ESP_LOGI(TAG, "LCD ready");
 }
