@@ -1,0 +1,17 @@
+.pio/
+.vscode/
+sdkconfig
+sdkconfig.old
+*.bin
+*.elf
+*.map
+build/
+src/config.h
+components/lvgl/
+managed_components/
+sdkconfig.*
+!sdkconfig.defaults
+
+# 系统与工具产生
+.DS_Store
+.playwright-mcp/

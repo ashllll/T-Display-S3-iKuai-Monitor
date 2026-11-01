@@ -1,0 +1,29 @@
+# T-Display-S3 必需配置（官方重点注意事项）
+# Flash: 16MB, QIO 80MHz
+CONFIG_ESPTOOLPY_FLASHSIZE_16MB=y
+CONFIG_ESPTOOLPY_FLASHMODE_QIO=y
+CONFIG_ESPTOOLPY_FLASHFREQ_80M=y
+# PSRAM: 8MB OPI（Octal）80MHz —— 不配则 PSRAM 不可用甚至无法启动
+CONFIG_SPIRAM=y
+CONFIG_SPIRAM_MODE_OCT=y
+CONFIG_SPIRAM_SPEED_80M=y
+CONFIG_SPIRAM_USE_MALLOC=y
+
+# Keep LVGL's Kconfig defaults compatible with the explicit LV_CONF_PATH build flag
+# in platformio.ini, which selects components/lv_conf.h for this target.
+# CONFIG_LV_CONF_SKIP is not set
+# CONFIG_LV_BUILD_EXAMPLES is not set
+
+# LVGL refreshes on a 16 ms period and the UI task sleeps with
+# vTaskDelay(pdMS_TO_TICKS(...)). At the 100 Hz default that rounds 16 ms to a single
+# 10 ms tick, so every frame was paced in 10/20 ms alternation and the animation clock
+# inherited the jitter. 1 kHz makes the sleep exact.
+CONFIG_FREERTOS_HZ=1000
+
+# The HTTP client needs a TLS context while LVGL is running. Keep mbedTLS data in
+# PSRAM and allocate record buffers on demand so the S3's internal heap is not
+# exhausted while LVGL and Wi-Fi are active.
+CONFIG_MBEDTLS_EXTERNAL_MEM_ALLOC=y
+CONFIG_MBEDTLS_DYNAMIC_BUFFER=y
+CONFIG_MBEDTLS_SSL_IN_CONTENT_LEN=8192
+CONFIG_MBEDTLS_SSL_OUT_CONTENT_LEN=2048
